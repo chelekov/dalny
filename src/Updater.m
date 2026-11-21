@@ -1,6 +1,7 @@
 #import "Updater.h"
 #import "DalnyLog.h"
 #import "Keychain.h"
+#import <Cocoa/Cocoa.h>
 #import <spawn.h>
 #import <unistd.h>
 

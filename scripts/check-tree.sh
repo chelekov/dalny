@@ -20,12 +20,12 @@ if info.get("LSMinimumSystemVersion") != "12.0":
     raise SystemExit("LSMinimumSystemVersion must be 12.0")
 PY
 
-if grep -R -n --exclude-dir=.git --exclude=check-tree.sh -e 'chelekov' . | grep -v 'chelekov/mac-rdp-client'; then
+if grep -R -n --exclude-dir=.git --exclude=check-tree.sh -e 'chelekov' . | grep -v 'chelekov/dalny'; then
 	echo "unexpected owner reference outside the updater repository slug" >&2
 	exit 1
 fi
 
-if ! grep -q 'chelekov/mac-rdp-client' src/Updater.m; then
+if ! grep -q 'chelekov/dalny' src/Updater.m; then
 	echo "updater is missing the release repository" >&2
 	exit 1
 fi

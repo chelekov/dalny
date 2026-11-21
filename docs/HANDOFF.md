@@ -6,7 +6,7 @@
 
 A self-contained macOS remote-desktop app. The `.app` embeds FreeRDP and OpenSSL. Nothing else is installed on the Mac.
 
-The app name is **Дальний** (bundle id `app.dalny.client`, executable `Dalny`). In-app updates read GitHub Releases for `chelekov/mac-rdp-client`.
+The app name is **Дальний** (bundle id `app.dalny.client`, executable `Dalny`). In-app updates read GitHub Releases for the public repo `chelekov/dalny` and do not require a token.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ The app name is **Дальний** (bundle id `app.dalny.client`, executable `Da
 - SSH tunnel on by default for new servers. Local forward to `127.0.0.1` only. Key or password auth. Secrets in the Keychain. Restart the tunnel on reconnect.
 - Built-in SSH key generation, copy public key, and install-on-server. Host-key confirmation writes every key type into `~/Library/Application Support/Dalny/known_hosts`. Later `ssh` calls pass `-o UserKnownHostsFile="<that path>"` (the path contains a space, so it is quoted) and `-o StrictHostKeyChecking=yes`. A host-key failure is not reported as a rejected password. Certificate trust-on-first-use with a stored fingerprint and a blocking warning when it changes. Never `/cert:ignore`.
 - No Terminal on the Mac for normal use. Logs are an in-app view with copy. README install steps use Finder and System Settings. The updater strips quarantine on the copy it installs.
-- In-app updates. Tags `v*` publish a GitHub Release of `Dalny-macos.zip`. **Настройки…** stores a fine-grained token (Contents: Read on `chelekov/mac-rdp-client`) in the Keychain. Launch and **Проверить обновления** call the Releases API, offer **Обновить**, download the asset with `Accept: application/octet-stream`, check the zip, bundle id `app.dalny.client`, and `codesign --verify`, replace the app, and relaunch. The token is never written to the log.
+- In-app updates. Tags `v*` publish a GitHub Release of `Dalny-macos.zip` on `chelekov/dalny`. Launch and **Проверить обновления** call the public Releases API with no token, offer **Обновить**, download the asset with `Accept: application/octet-stream`, check the zip, bundle id `app.dalny.client`, and `codesign --verify`, replace the app, and relaunch. A 403 that is a rate limit asks the user to retry later. **Настройки…** can store an optional token for a private fork; it is not required for the public repo and is never written to the log.
 - A network change (including a VPN coming up or down) triggers a clean reconnect. TCP keepalives and SSH `ServerAliveInterval` detect a dead link. Status text says what is happening and why it failed. If a VPN sends all traffic through the same host, that host belongs on the VPN bypass list.
 - README in Russian: install, usage, keyboard, graphics, network changes, and a short server-hardening section. Do not recommend `crypt_level=none`.
 

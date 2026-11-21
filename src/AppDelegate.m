@@ -322,11 +322,11 @@
 		                                               backing:NSBackingStoreBuffered
 		                                                 defer:NO];
 		_settingsWindow.title = @"Настройки";
-		NSTextField* title = [NSTextField labelWithString:@"Токен GitHub"];
+		NSTextField* title = [NSTextField labelWithString:@"Токен GitHub, необязательно"];
 		_tokenField = [NSSecureTextField new];
 		_tokenField.translatesAutoresizingMaskIntoConstraints = NO;
-		_tokenField.placeholderString = @"fine-grained, только Contents: Read";
-		NSTextField* hint = [NSTextField wrappingLabelWithString:@"Токен только для чтения репозитория chelekov/mac-rdp-client (Contents: Read). Он хранится в Связке ключей и не пишется в журнал. Пустое поле стирает сохранённый токен."];
+		_tokenField.placeholderString = @"не нужен для публичного репозитория";
+		NSTextField* hint = [NSTextField wrappingLabelWithString:@"Обновления chelekov/dalny качаются без токена. Поле нужно только для приватной копии репозитория, если GitHub ограничил число запросов. Токен не пишется в журнал. Пустое поле стирает сохранённый токен."];
 		hint.preferredMaxLayoutWidth = 460;
 		NSButton* save = [NSButton buttonWithTitle:@"Сохранить" target:self action:@selector(saveToken:)];
 		save.keyEquivalent = @"\r";

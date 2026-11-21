@@ -7,6 +7,7 @@
 extern char** environ;
 
 static NSString* const kTokenAccount = @"github-token";
+static NSString* const kRepo = @"chelekov/dalny";
 static NSString* const kBundleID = @"app.dalny.client";
 static NSString* const kAssetName = @"Dalny-macos.zip";
 static NSInteger const kMaxZipBytes = 250 * 1024 * 1024;
@@ -72,12 +73,14 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 	self.status = http.statusCode;
 	if (http.statusCode != 200)
 	{
+		NSString* payload = [NSString stringWithContentsOfURL:location encoding:NSUTF8StringEncoding error:NULL] ?: @"";
+		BOOL rateLimited = [payload rangeOfString:@"rate limit" options:NSCaseInsensitiveSearch].location != NSNotFound;
+		NSString* message = rateLimited
+		                        ? @"GitHub временно ограничил число запросов. Повторите обновление позже."
+		                        : [NSString stringWithFormat:@"GitHub ответил HTTP %ld при скачивании.", (long)http.statusCode];
 		self.error = [NSError errorWithDomain:@"app.dalny.client.update"
 		                                 code:http.statusCode
-		                             userInfo:@{
-			                             NSLocalizedDescriptionKey :
-			                                 [NSString stringWithFormat:@"GitHub ответил HTTP %ld при скачивании.", (long)http.statusCode]
-		                             }];
+		                             userInfo:@{NSLocalizedDescriptionKey : message}];
 		return;
 	}
 	[[NSFileManager defaultManager] removeItemAtURL:self.destination error:NULL];
@@ -134,31 +137,15 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 		return;
 	busy = YES;
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSError* keychainError = nil;
+		NSString* token = Trim([Keychain secretForAccount:kTokenAccount error:&keychainError]);
+		if (keychainError)
+			[DalnyLog append:Redact(keychainError.localizedDescription, token)];
 		NSError* error = nil;
-		NSString* token = [Keychain secretForAccount:kTokenAccount error:&error];
-		if (error)
-		{
-			[self finishInteractive:interactive message:Redact(error.localizedDescription, token)];
-			busy = NO;
-			return;
-		}
-		token = Trim(token);
-		if (token.length == 0)
-		{
-			if (interactive)
-			{
-				[self finishInteractive:YES
-				                message:@"В Настройках нет токена GitHub. Создайте fine-grained token только для "
-				                        @"репозитория chelekov/mac-rdp-client с правом Contents: Read и вставьте его в "
-				                        @"меню «Дальний → Настройки…»."];
-			}
-			busy = NO;
-			return;
-		}
 		NSDictionary* release = [self latestReleaseWithToken:token error:&error];
 		if (!release)
 		{
-			BOOL show = interactive || error.code == 401 || error.code == 403;
+			BOOL show = interactive || error.code == 401;
 			[self finishInteractive:show message:Redact(error.localizedDescription, token)];
 			busy = NO;
 			return;
@@ -235,10 +222,12 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 
 + (NSDictionary*)latestReleaseWithToken:(NSString*)token error:(NSError**)error
 {
-	NSURL* url = [NSURL URLWithString:@"https://api.github.com/repos/chelekov/mac-rdp-client/releases/latest"];
+	NSString* address = [NSString stringWithFormat:@"https://api.github.com/repos/%@/releases/latest", kRepo];
+	NSURL* url = [NSURL URLWithString:address];
 	NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:url];
 	request.timeoutInterval = 30;
-	[request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+	if (token.length > 0)
+		[request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
 	[request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
 	[request setValue:@"2022-11-28" forHTTPHeaderField:@"X-GitHub-Api-Version"];
 	[request setValue:@"Dalny" forHTTPHeaderField:@"User-Agent"];
@@ -265,14 +254,27 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 			                         userInfo:@{NSLocalizedDescriptionKey : Redact(taskError.localizedDescription, token)}];
 		return nil;
 	}
-	if (status == 401 || status == 403)
+	NSString* payload = [[NSString alloc] initWithData:body ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"";
+	BOOL rateLimited = [payload rangeOfString:@"rate limit" options:NSCaseInsensitiveSearch].location != NSNotFound;
+	if (status == 403 && rateLimited)
 	{
 		if (error)
 			*error = [NSError errorWithDomain:@"app.dalny.client.update"
 			                             code:status
 			                         userInfo:@{
-				                         NSLocalizedDescriptionKey : @"GitHub не принял токен. Нужен fine-grained token "
-				                                                      @"только для chelekov/mac-rdp-client с правом Contents: Read."
+				                         NSLocalizedDescriptionKey :
+				                             @"GitHub временно ограничил число запросов. Повторите проверку позже."
+			                         }];
+		return nil;
+	}
+	if (status == 401)
+	{
+		if (error)
+			*error = [NSError errorWithDomain:@"app.dalny.client.update"
+			                             code:status
+			                         userInfo:@{
+				                         NSLocalizedDescriptionKey :
+				                             @"GitHub не принял необязательный токен. Для публичного репозитория сотрите его в Настройках."
 			                         }];
 		return nil;
 	}
@@ -283,8 +285,7 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 			                             code:status
 			                         userInfo:@{
 				                         NSLocalizedDescriptionKey :
-				                             [NSString stringWithFormat:@"GitHub ответил HTTP %ld. Релиза пока нет или токен его не видит.",
-				                                                          (long)status]
+				                             [NSString stringWithFormat:@"GitHub ответил HTTP %ld. Релиза пока нет.", (long)status]
 			                         }];
 		return nil;
 	}
@@ -409,7 +410,8 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 	config.timeoutIntervalForResource = 180;
 	NSURLSession* session = [NSURLSession sessionWithConfiguration:config delegate:fetcher delegateQueue:queue];
 	NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:assetURL]];
-	[request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+	if (token.length > 0)
+		[request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
 	[request setValue:@"application/octet-stream" forHTTPHeaderField:@"Accept"];
 	[request setValue:@"Dalny" forHTTPHeaderField:@"User-Agent"];
 	NSURLSessionDownloadTask* task = [session downloadTaskWithRequest:request];

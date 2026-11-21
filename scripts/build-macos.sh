@@ -2,6 +2,42 @@
 # Builds a self-contained Dalny.app for macOS 12.0.
 # Default architecture is x86_64. DALNY_UNIVERSAL=1 also builds arm64 and lipos.
 set -euo pipefail
+set -o errtrace
+
+# On GitHub Actions, report where the script stopped as an annotation. Annotations can be read
+# without a token, job logs cannot.
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+	trap 'echo "::error file=scripts/build-macos.sh,line=$LINENO::failed: $BASH_COMMAND"' ERR
+fi
+
+# Runs a compiler command. Errors become GitHub annotations with file and line.
+compile() {
+	local log
+	log="$(mktemp)"
+	if "$@" 2>"$log"; then
+		cat "$log" >&2
+		rm -f "$log"
+		return 0
+	fi
+	cat "$log" >&2
+	if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+		grep -E '^[^ :]+:[0-9]+:[0-9]+: (fatal )?error: ' "$log" | head -n 20 |
+			while IFS= read -r line; do
+				local file="${line%%:*}"
+				local rest="${line#*:}"
+				local lineno="${rest%%:*}"
+				local message="${line#*error: }"
+				file="${file#"$ROOT"/}"
+				echo "::error file=$file,line=$lineno::$message"
+			done || true
+		if ! grep -q -E ': (fatal )?error: ' "$log"; then
+			# Linker and other errors: the last lines, joined into one annotation.
+			echo "::error::$(tail -n 8 "$log" | tr '\n' ' ' | cut -c1-900)"
+		fi
+	fi
+	rm -f "$log"
+	return 1
+}
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -187,18 +223,18 @@ SDK="$SDKROOT"
 COMMON=(-mmacosx-version-min=12.0 "${CLANG_ARCHS[@]}" -isysroot "$SDK")
 # FreeRDP headers use nullptr. Objective-C and C files are not C++, so map it.
 for src in src/*.m; do
-	clang -fobjc-arc -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c "$src" -o "$OBJDIR/$(basename "${src%.m}").o"
+	compile clang -fobjc-arc -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c "$src" -o "$OBJDIR/$(basename "${src%.m}").o"
 done
-clang -std=c11 -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c src/AppleKeyboard.c -o "$OBJDIR/AppleKeyboard.o"
-clang -std=c11 -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c src/Scancode.c -o "$OBJDIR/Scancode.o"
-clang++ -std=c++17 -fno-objc-arc "${COMMON[@]}" "${INC[@]}" -c src/session.mm -o "$OBJDIR/session.o"
+compile clang -std=c11 -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c src/AppleKeyboard.c -o "$OBJDIR/AppleKeyboard.o"
+compile clang -std=c11 -Dnullptr=NULL "${COMMON[@]}" "${INC[@]}" -c src/Scancode.c -o "$OBJDIR/Scancode.o"
+compile clang++ -std=c++17 -fno-objc-arc "${COMMON[@]}" "${INC[@]}" -c src/session.mm -o "$OBJDIR/session.o"
 clang "${COMMON[@]}" -o "$WORK/DalnyAskpass" src/askpass.c
 
 LIB_FLAGS=(-lfreerdp-client -lfreerdp -lwinpr)
 if [[ ! -f "$FREERDP/lib/libfreerdp.dylib" ]]; then
 	LIB_FLAGS=(-lfreerdp-client3 -lfreerdp3 -lwinpr3)
 fi
-clang "${COMMON[@]}" "$OBJDIR"/*.o \
+compile clang "${COMMON[@]}" "$OBJDIR"/*.o \
 	-L"$FREERDP/lib" -L"$OPENSSL/lib" \
 	"${LIB_FLAGS[@]}" -lssl -lcrypto -lz -lc++ \
 	-framework Cocoa -framework Security -framework IOKit -framework Network \

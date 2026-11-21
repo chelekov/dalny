@@ -1,0 +1,1040 @@
+#include "session.h"
+
+#include <freerdp/freerdp.h>
+#include <freerdp/client.h>
+#include <freerdp/client/cliprdr.h>
+#include <freerdp/client/disp.h>
+#include <freerdp/gdi/gdi.h>
+#include <freerdp/gdi/dc.h>
+#include <freerdp/gdi/region.h>
+#include <freerdp/codec/color.h>
+#include <freerdp/constants.h>
+#include <freerdp/addin.h>
+#include <freerdp/input.h>
+#include <freerdp/scancode.h>
+#include <freerdp/channels/cliprdr.h>
+#include <freerdp/channels/disp.h>
+
+#include <winpr/clipboard.h>
+#include <winpr/user.h>
+#include <winpr/synch.h>
+#include <winpr/collections.h>
+#include <winpr/string.h>
+
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+static void wipe_bytes(void* buffer, size_t length)
+{
+	volatile unsigned char* bytes = (volatile unsigned char*)buffer;
+	while (length > 0)
+		bytes[--length] = 0;
+}
+
+struct RDPSession
+{
+	RDPParams params;
+	RDPHandlers handlers;
+	rdpContext* context;
+	freerdp* instance;
+	pthread_t thread;
+	int threadStarted;
+	volatile int stop;
+	int authFailed;
+	int certRejected;
+	HANDLE stopEvent;
+	HANDLE resizeEvent;
+	int resizeWidth;
+	int resizeHeight;
+	int remoteWidth;
+	int remoteHeight;
+	pthread_mutex_t lock;
+
+	CliprdrClientContext* cliprdr;
+	wClipboard* clipboard;
+	UINT32* serverFormatIds;
+	char** serverFormatNames;
+	UINT32 serverFormatCount;
+	UINT32 requestedFormatId;
+	char* pendingClipboard;
+
+	DispClientContext* disp;
+	int resizeNoteLogged;
+};
+
+typedef struct
+{
+	rdpClientContext common;
+	RDPSession* session;
+} DalnyContext;
+
+static FREERDP_LOAD_CHANNEL_ADDIN_ENTRY_FN g_previousProvider = nullptr;
+static char g_pluginDir[1024] = {0};
+
+static void log_line(RDPSession* session, const char* line)
+{
+	if (session && session->handlers.logmsg && line)
+		session->handlers.logmsg(session->handlers.ctx, line);
+}
+
+static RDPSession* session_from(rdpContext* context)
+{
+	if (!context)
+		return nullptr;
+	return ((DalnyContext*)context)->session;
+}
+
+static char* normalize_fingerprint(const char* fingerprint)
+{
+	if (!fingerprint)
+		return nullptr;
+	size_t length = strlen(fingerprint);
+	char* out = (char*)calloc(length + 1, 1);
+	if (!out)
+		return nullptr;
+	size_t j = 0;
+	for (size_t i = 0; i < length; i++)
+	{
+		unsigned char c = (unsigned char)fingerprint[i];
+		if (c == ':' || c == ' ' || c == '\t')
+			continue;
+		out[j++] = (char)tolower(c);
+	}
+	return out;
+}
+
+static int fingerprints_match(const char* stored, const char* presented)
+{
+	if (!stored || !stored[0] || !presented || !presented[0])
+		return 0;
+	char* a = normalize_fingerprint(stored);
+	char* b = normalize_fingerprint(presented);
+	int match = (a && b && strcmp(a, b) == 0);
+	free(a);
+	free(b);
+	return match;
+}
+
+static DWORD verify_certificate(freerdp* instance, const char* fingerprint)
+{
+	RDPSession* session = session_from(instance ? instance->context : nullptr);
+	if (!session)
+		return 0;
+	if (!fingerprint)
+		fingerprint = "";
+
+	if (fingerprints_match(session->params.trustedFingerprint, fingerprint))
+	{
+		log_line(session, "Сертификат совпал с сохранённым отпечатком.");
+		return 1;
+	}
+
+	int changed = session->params.trustedFingerprint[0] != '\0';
+	char line[768];
+	snprintf(line, sizeof(line), "Проверка сертификата: %s", fingerprint);
+	log_line(session, line);
+
+	int accept = 0;
+	if (session->handlers.ask_certificate)
+		accept = session->handlers.ask_certificate(session->handlers.ctx, fingerprint, changed);
+	if (!accept)
+	{
+		session->certRejected = 1;
+		log_line(session, "Сертификат отклонён.");
+		return 0;
+	}
+
+	snprintf(session->params.trustedFingerprint, sizeof(session->params.trustedFingerprint), "%s",
+	         fingerprint);
+	log_line(session, changed ? "Сохранён новый отпечаток сертификата."
+	                          : "Отпечаток сертификата сохранён.");
+	return 1;
+}
+
+static DWORD verify_cert_ex(freerdp* instance, const char* host, UINT16 port, const char* commonName,
+                            const char* subject, const char* issuer, const char* fingerprint,
+                            DWORD flags)
+{
+	(void)host;
+	(void)port;
+	(void)commonName;
+	(void)subject;
+	(void)issuer;
+	(void)flags;
+	return verify_certificate(instance, fingerprint);
+}
+
+static DWORD verify_changed_cert_ex(freerdp* instance, const char* host, UINT16 port,
+                                    const char* commonName, const char* subject, const char* issuer,
+                                    const char* fingerprint, const char* oldSubject,
+                                    const char* oldIssuer, const char* oldFingerprint, DWORD flags)
+{
+	(void)host;
+	(void)port;
+	(void)commonName;
+	(void)subject;
+	(void)issuer;
+	(void)oldSubject;
+	(void)oldIssuer;
+	(void)oldFingerprint;
+	(void)flags;
+	return verify_certificate(instance, fingerprint);
+}
+
+static BOOL authenticate_ex(freerdp* instance, char** username, char** password, char** domain,
+                            rdp_auth_reason reason)
+{
+	(void)domain;
+	RDPSession* session = session_from(instance ? instance->context : nullptr);
+	if (reason == AUTH_SMARTCARD_PIN)
+		return FALSE;
+	if (username && *username && *username[0] && password && *password && *password[0])
+		return TRUE;
+	if (!session || !session->params.password[0] || !session->params.username[0])
+	{
+		if (session)
+			session->authFailed = 1;
+		return FALSE;
+	}
+	if (username && !*username)
+		*username = _strdup(session->params.username);
+	if (password && !*password)
+		*password = _strdup(session->params.password);
+	return TRUE;
+}
+
+static int logon_error_info(freerdp* instance, UINT32 data, UINT32 type)
+{
+	RDPSession* session = session_from(instance ? instance->context : nullptr);
+	const char* dataText = freerdp_get_logon_error_info_data(data);
+	const char* typeText = freerdp_get_logon_error_info_type(type);
+	char line[512];
+	snprintf(line, sizeof(line), "Ответ входа: %s (%s)", typeText ? typeText : "?",
+	         dataText ? dataText : "?");
+	if (session)
+	{
+		log_line(session, line);
+		if (typeText && (strstr(typeText, "FAIL") || strstr(typeText, "ERR") ||
+		                 strstr(typeText, "DENIED")))
+			session->authFailed = 1;
+	}
+	return 1;
+}
+
+static BOOL begin_paint(rdpContext* context)
+{
+	rdpGdi* gdi = context ? context->gdi : nullptr;
+	if (!gdi || !gdi->primary || !gdi->primary->hdc || !gdi->primary->hdc->hwnd ||
+	    !gdi->primary->hdc->hwnd->invalid)
+		return TRUE;
+	gdi->primary->hdc->hwnd->invalid->null = TRUE;
+	return TRUE;
+}
+
+static BOOL end_paint(rdpContext* context)
+{
+	RDPSession* session = session_from(context);
+	rdpGdi* gdi = context ? context->gdi : nullptr;
+	if (!session || !gdi || !gdi->primary || !gdi->primary->hdc || !gdi->primary->hdc->hwnd)
+		return TRUE;
+	HGDI_RGN invalid = gdi->primary->hdc->hwnd->invalid;
+	if (!invalid || invalid->null)
+		return TRUE;
+
+	int x = invalid->x;
+	int y = invalid->y;
+	int w = invalid->w;
+	int h = invalid->h;
+	gdi->primary->hdc->hwnd->ninvalid = 0;
+	session->remoteWidth = gdi->width;
+	session->remoteHeight = gdi->height;
+	if (session->handlers.frame && gdi->primary_buffer)
+	{
+		session->handlers.frame(session->handlers.ctx, gdi->primary_buffer, gdi->width, gdi->height,
+		                        (int)gdi->stride, x, y, w, h);
+	}
+	return TRUE;
+}
+
+static BOOL desktop_resize(rdpContext* context)
+{
+	RDPSession* session = session_from(context);
+	if (!context || !context->gdi)
+		return TRUE;
+	UINT32 width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+	UINT32 height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+	if (!gdi_resize(context->gdi, width, height))
+		return FALSE;
+	if (session)
+	{
+		session->remoteWidth = (int)width;
+		session->remoteHeight = (int)height;
+		if (session->handlers.resized)
+			session->handlers.resized(session->handlers.ctx, (int)width, (int)height);
+		char line[128];
+		snprintf(line, sizeof(line), "Размер рабочего стола: %ux%u", width, height);
+		log_line(session, line);
+	}
+	return TRUE;
+}
+
+static void free_server_formats(RDPSession* session)
+{
+	if (!session->serverFormatNames)
+	{
+		free(session->serverFormatIds);
+		session->serverFormatIds = nullptr;
+		session->serverFormatCount = 0;
+		return;
+	}
+	for (UINT32 i = 0; i < session->serverFormatCount; i++)
+		free(session->serverFormatNames[i]);
+	free(session->serverFormatNames);
+	free(session->serverFormatIds);
+	session->serverFormatNames = nullptr;
+	session->serverFormatIds = nullptr;
+	session->serverFormatCount = 0;
+}
+
+static UINT clip_send_format_list(RDPSession* session)
+{
+	if (!session->cliprdr || !session->clipboard)
+		return CHANNEL_RC_OK;
+
+	UINT32* ids = nullptr;
+	UINT32 count = ClipboardGetFormatIds(session->clipboard, &ids);
+	CLIPRDR_FORMAT* formats =
+	    (CLIPRDR_FORMAT*)calloc(count > 0 ? count : 1, sizeof(CLIPRDR_FORMAT));
+	if (!formats)
+	{
+		free(ids);
+		return CHANNEL_RC_NO_MEMORY;
+	}
+	for (UINT32 i = 0; i < count; i++)
+	{
+		formats[i].formatId = ids[i];
+		const char* name = ClipboardGetFormatName(session->clipboard, ids[i]);
+		if (ids[i] > CF_MAX && name)
+			formats[i].formatName = _strdup(name);
+	}
+
+	CLIPRDR_FORMAT_LIST list = {};
+	list.common.msgType = CB_FORMAT_LIST;
+	list.numFormats = count;
+	list.formats = formats;
+	UINT result = session->cliprdr->ClientFormatList(session->cliprdr, &list);
+	for (UINT32 i = 0; i < count; i++)
+		free(formats[i].formatName);
+	free(formats);
+	free(ids);
+	return result;
+}
+
+static UINT clip_monitor_ready(CliprdrClientContext* cliprdr, const CLIPRDR_MONITOR_READY* ready)
+{
+	(void)ready;
+	RDPSession* session = (RDPSession*)cliprdr->custom;
+	CLIPRDR_CAPABILITIES caps;
+	CLIPRDR_GENERAL_CAPABILITY_SET general;
+	memset(&caps, 0, sizeof(caps));
+	memset(&general, 0, sizeof(general));
+	caps.cCapabilitiesSets = 1;
+	caps.capabilitySets = (CLIPRDR_CAPABILITY_SET*)&general;
+	general.capabilitySetType = CB_CAPSTYPE_GENERAL;
+	general.capabilitySetLength = 12;
+	general.version = CB_CAPS_VERSION_2;
+	general.generalFlags = CB_USE_LONG_FORMAT_NAMES;
+	cliprdr->ClientCapabilities(cliprdr, &caps);
+
+	pthread_mutex_lock(&session->lock);
+	if (session->pendingClipboard)
+	{
+		UINT32 format = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
+		ClipboardSetData(session->clipboard, format, session->pendingClipboard,
+		                 (UINT32)strlen(session->pendingClipboard) + 1);
+	}
+	UINT result = clip_send_format_list(session);
+	pthread_mutex_unlock(&session->lock);
+	log_line(session, "Буфер обмена подключён.");
+	return result;
+}
+
+static UINT clip_server_format_list(CliprdrClientContext* cliprdr, const CLIPRDR_FORMAT_LIST* list)
+{
+	RDPSession* session = (RDPSession*)cliprdr->custom;
+	CLIPRDR_FORMAT_LIST_RESPONSE response;
+	memset(&response, 0, sizeof(response));
+	response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+	response.common.msgFlags = CB_RESPONSE_OK;
+	cliprdr->ClientFormatListResponse(cliprdr, &response);
+
+	pthread_mutex_lock(&session->lock);
+	free_server_formats(session);
+	session->serverFormatCount = list->numFormats;
+	if (list->numFormats > 0)
+	{
+		session->serverFormatIds = (UINT32*)calloc(list->numFormats, sizeof(UINT32));
+		session->serverFormatNames = (char**)calloc(list->numFormats, sizeof(char*));
+		for (UINT32 i = 0; i < list->numFormats; i++)
+		{
+			session->serverFormatIds[i] = list->formats[i].formatId;
+			if (list->formats[i].formatName)
+				session->serverFormatNames[i] = _strdup(list->formats[i].formatName);
+		}
+	}
+	UINT32 wanted = 0;
+	for (UINT32 i = 0; i < session->serverFormatCount; i++)
+	{
+		if (session->serverFormatIds[i] == CF_UNICODETEXT)
+		{
+			wanted = CF_UNICODETEXT;
+			break;
+		}
+		if (wanted == 0 && (session->serverFormatIds[i] == CF_TEXT ||
+		                    session->serverFormatIds[i] == CF_OEMTEXT))
+			wanted = session->serverFormatIds[i];
+	}
+	session->requestedFormatId = wanted;
+	pthread_mutex_unlock(&session->lock);
+
+	if (wanted == 0)
+		return CHANNEL_RC_OK;
+	CLIPRDR_FORMAT_DATA_REQUEST request = {};
+	request.common.msgType = CB_FORMAT_DATA_REQUEST;
+	request.requestedFormatId = wanted;
+	return cliprdr->ClientFormatDataRequest(cliprdr, &request);
+}
+
+static UINT clip_format_list_response(CliprdrClientContext* cliprdr,
+                                      const CLIPRDR_FORMAT_LIST_RESPONSE* response)
+{
+	(void)cliprdr;
+	(void)response;
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_format_data_request(CliprdrClientContext* cliprdr,
+                                     const CLIPRDR_FORMAT_DATA_REQUEST* request)
+{
+	RDPSession* session = (RDPSession*)cliprdr->custom;
+	UINT32 size = 0;
+	pthread_mutex_lock(&session->lock);
+	BYTE* data = (BYTE*)ClipboardGetData(session->clipboard, request->requestedFormatId, &size);
+	pthread_mutex_unlock(&session->lock);
+
+	CLIPRDR_FORMAT_DATA_RESPONSE response = {};
+	response.common.msgFlags = data ? CB_RESPONSE_OK : CB_RESPONSE_FAIL;
+	response.common.dataLen = data ? size : 0;
+	response.requestedFormatData = data;
+	UINT result = cliprdr->ClientFormatDataResponse(cliprdr, &response);
+	free(data);
+	return result;
+}
+
+static UINT clip_format_data_response(CliprdrClientContext* cliprdr,
+                                      const CLIPRDR_FORMAT_DATA_RESPONSE* response)
+{
+	RDPSession* session = (RDPSession*)cliprdr->custom;
+	if (!session || (response->common.msgFlags & CB_RESPONSE_FAIL))
+		return CHANNEL_RC_OK;
+
+	pthread_mutex_lock(&session->lock);
+	UINT32 formatId = session->requestedFormatId;
+	ClipboardSetData(session->clipboard, formatId, response->requestedFormatData,
+	                 response->common.dataLen);
+	UINT32 utf8Id = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
+	UINT32 utf8Size = 0;
+	char* utf8 = (char*)ClipboardGetData(session->clipboard, utf8Id, &utf8Size);
+	pthread_mutex_unlock(&session->lock);
+
+	if (utf8 && session->handlers.clipboard_text)
+	{
+		if (utf8Size > 0 && utf8[utf8Size - 1] == '\0')
+			utf8Size--;
+		utf8[utf8Size] = '\0';
+		session->handlers.clipboard_text(session->handlers.ctx, utf8);
+	}
+	free(utf8);
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_capabilities(CliprdrClientContext* cliprdr, const CLIPRDR_CAPABILITIES* caps)
+{
+	(void)cliprdr;
+	(void)caps;
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_lock(CliprdrClientContext* cliprdr, const CLIPRDR_LOCK_CLIPBOARD_DATA* data)
+{
+	(void)cliprdr;
+	(void)data;
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_unlock(CliprdrClientContext* cliprdr, const CLIPRDR_UNLOCK_CLIPBOARD_DATA* data)
+{
+	(void)cliprdr;
+	(void)data;
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_file_request(CliprdrClientContext* cliprdr,
+                              const CLIPRDR_FILE_CONTENTS_REQUEST* request)
+{
+	(void)cliprdr;
+	(void)request;
+	return CHANNEL_RC_OK;
+}
+
+static UINT clip_file_response(CliprdrClientContext* cliprdr,
+                               const CLIPRDR_FILE_CONTENTS_RESPONSE* response)
+{
+	(void)cliprdr;
+	(void)response;
+	return CHANNEL_RC_OK;
+}
+
+static void on_channel_connected(void* context, const ChannelConnectedEventArgs* event)
+{
+	DalnyContext* dalny = (DalnyContext*)context;
+	RDPSession* session = dalny ? dalny->session : nullptr;
+	if (!session || !event || !event->name)
+		return;
+
+	if (strcmp(event->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
+	{
+		CliprdrClientContext* clip = (CliprdrClientContext*)event->pInterface;
+		clip->custom = session;
+		session->cliprdr = clip;
+		if (!session->clipboard)
+			session->clipboard = ClipboardCreate();
+		clip->MonitorReady = clip_monitor_ready;
+		clip->ServerCapabilities = clip_capabilities;
+		clip->ServerFormatList = clip_server_format_list;
+		clip->ServerFormatListResponse = clip_format_list_response;
+		clip->ServerLockClipboardData = clip_lock;
+		clip->ServerUnlockClipboardData = clip_unlock;
+		clip->ServerFormatDataRequest = clip_format_data_request;
+		clip->ServerFormatDataResponse = clip_format_data_response;
+		clip->ServerFileContentsRequest = clip_file_request;
+		clip->ServerFileContentsResponse = clip_file_response;
+		return;
+	}
+
+	if (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0 || strcmp(event->name, "disp") == 0)
+	{
+		session->disp = (DispClientContext*)event->pInterface;
+		log_line(session, "Сервер разрешил менять размер экрана.");
+		return;
+	}
+
+	freerdp_client_OnChannelConnectedEventHandler(context, event);
+}
+
+static void on_channel_disconnected(void* context, const ChannelDisconnectedEventArgs* event)
+{
+	DalnyContext* dalny = (DalnyContext*)context;
+	RDPSession* session = dalny ? dalny->session : nullptr;
+	if (session && event && event->name)
+	{
+		if (strcmp(event->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
+			session->cliprdr = nullptr;
+		if (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0 || strcmp(event->name, "disp") == 0)
+			session->disp = nullptr;
+	}
+	freerdp_client_OnChannelDisconnectedEventHandler(context, event);
+}
+
+static void apply_graphics(rdpSettings* settings, const RDPParams* params)
+{
+	int profile = params->profile;
+	if (profile < 0 || profile > 2)
+		profile = 0;
+	int depth = params->colorDepth == 16 ? 16 : 32;
+	UINT32 width = (UINT32)(params->width < 200 ? 200 : params->width);
+	UINT32 height = (UINT32)(params->height < 200 ? 200 : params->height);
+	width &= ~1u;
+	height &= ~1u;
+
+	freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, width);
+	freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height);
+	freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, (UINT32)depth);
+
+	freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, profile == 0);
+	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_JpegCodec, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
+	freerdp_settings_set_uint32(settings, FreeRDP_ConnectionType, CONNECTION_TYPE_LAN);
+	freerdp_settings_set_bool(settings, FreeRDP_CompressionEnabled, TRUE);
+	freerdp_settings_set_uint32(settings, FreeRDP_CompressionLevel, PACKET_COMPR_TYPE_RDP61);
+	freerdp_settings_set_bool(settings, FreeRDP_BitmapCacheEnabled, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_BitmapCompressionDisabled, FALSE);
+
+	freerdp_settings_set_bool(settings, FreeRDP_DisableWallpaper, profile != 2);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableFullWindowDrag, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableMenuAnims, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableThemes, profile == 0);
+	freerdp_settings_set_bool(settings, FreeRDP_AllowFontSmoothing, profile == 2);
+	freerdp_settings_set_bool(settings, FreeRDP_AllowDesktopComposition, FALSE);
+
+	freerdp_settings_set_uint32(settings, FreeRDP_KeyboardLayout, 0x00000409);
+	freerdp_settings_set_uint32(settings, FreeRDP_KeyboardType, 4);
+	freerdp_settings_set_uint32(settings, FreeRDP_KeyboardSubType, 0);
+	freerdp_settings_set_uint32(settings, FreeRDP_KeyboardFunctionKey, 12);
+
+	freerdp_settings_set_bool(settings, FreeRDP_AutoReconnectionEnabled, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_TcpKeepAlive, TRUE);
+	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveDelay, 10);
+	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveInterval, 5);
+	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveRetries, 3);
+	freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, TRUE);
+	freerdp_settings_set_uint32(settings, FreeRDP_TcpConnectTimeout, 15000);
+	freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NegotiateSecurityLayer, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_FastPathInput, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_FastPathOutput, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, params->clipboard ? TRUE : FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_DynamicResolutionUpdate, TRUE);
+	freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_MACINTOSH);
+	freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_MACINTOSH);
+}
+
+static BOOL pre_connect(freerdp* instance)
+{
+	rdpContext* context = instance->context;
+	rdpSettings* settings = context->settings;
+	RDPSession* session = session_from(context);
+	context->update->BeginPaint = begin_paint;
+	context->update->EndPaint = end_paint;
+	context->update->DesktopResize = desktop_resize;
+	if (session)
+		apply_graphics(settings, &session->params);
+	freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_MACINTOSH);
+	freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_MACINTOSH);
+	PubSub_SubscribeChannelConnected(context->pubSub, on_channel_connected);
+	PubSub_SubscribeChannelDisconnected(context->pubSub, on_channel_disconnected);
+	return TRUE;
+}
+
+static BOOL post_connect(freerdp* instance)
+{
+	if (!gdi_init(instance, PIXEL_FORMAT_BGRX32))
+		return FALSE;
+	RDPSession* session = session_from(instance->context);
+	if (session && instance->context->gdi)
+	{
+		session->remoteWidth = instance->context->gdi->width;
+		session->remoteHeight = instance->context->gdi->height;
+		char line[160];
+		snprintf(line, sizeof(line), "Сеанс открыт, %dx%d, %d бит.", session->remoteWidth,
+		         session->remoteHeight,
+		         (int)freerdp_settings_get_uint32(instance->context->settings, FreeRDP_ColorDepth));
+		log_line(session, line);
+	}
+	return TRUE;
+}
+
+static void post_disconnect(freerdp* instance)
+{
+	if (!instance || !instance->context)
+		return;
+	PubSub_UnsubscribeChannelConnected(instance->context->pubSub, on_channel_connected);
+	PubSub_UnsubscribeChannelDisconnected(instance->context->pubSub, on_channel_disconnected);
+	gdi_free(instance);
+}
+
+static BOOL client_new(freerdp* instance, rdpContext* context)
+{
+	(void)context;
+	instance->PreConnect = pre_connect;
+	instance->PostConnect = post_connect;
+	instance->PostDisconnect = post_disconnect;
+	instance->AuthenticateEx = authenticate_ex;
+	instance->VerifyCertificateEx = verify_cert_ex;
+	instance->VerifyChangedCertificateEx = verify_changed_cert_ex;
+	instance->LogonErrorInfo = logon_error_info;
+	return TRUE;
+}
+
+static void client_free(freerdp* instance, rdpContext* context)
+{
+	(void)instance;
+	(void)context;
+}
+
+static int client_entry(RDP_CLIENT_ENTRY_POINTS* entry)
+{
+	entry->Version = RDP_CLIENT_INTERFACE_VERSION;
+	entry->Size = sizeof(RDP_CLIENT_ENTRY_POINTS_V1);
+	entry->ContextSize = sizeof(DalnyContext);
+	entry->ClientNew = client_new;
+	entry->ClientFree = client_free;
+	return 0;
+}
+
+static PVIRTUALCHANNELENTRY load_plugin(const char* name, DWORD flags)
+{
+	if (!name || !g_pluginDir[0])
+		return nullptr;
+	const char* suffix = "VirtualChannelEntryEx";
+	if (flags & FREERDP_ADDIN_CHANNEL_DYNAMIC)
+		suffix = "DVCPluginEntry";
+	else if ((flags & FREERDP_ADDIN_CHANNEL_STATIC) && !(flags & FREERDP_ADDIN_CHANNEL_ENTRYEX))
+		suffix = "VirtualChannelEntry";
+
+	char path[1200];
+	snprintf(path, sizeof(path), "%s/lib%s-client.dylib", g_pluginDir, name);
+	void* library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (!library)
+	{
+		snprintf(path, sizeof(path), "%s/lib%s-client.3.dylib", g_pluginDir, name);
+		library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	}
+	if (!library)
+		return nullptr;
+	void* symbol = dlsym(library, suffix);
+	if (!symbol)
+		symbol = dlsym(library, "VirtualChannelEntryEx");
+	if (!symbol)
+		symbol = dlsym(library, "DVCPluginEntry");
+	if (!symbol)
+	{
+		dlclose(library);
+		return nullptr;
+	}
+	return (PVIRTUALCHANNELENTRY)symbol;
+}
+
+static PVIRTUALCHANNELENTRY addin_provider(LPCSTR name, LPCSTR subsystem, LPCSTR type, DWORD flags)
+{
+	(void)subsystem;
+	(void)type;
+	PVIRTUALCHANNELENTRY entry = nullptr;
+	if (g_previousProvider)
+		entry = g_previousProvider(name, subsystem, type, flags);
+	if (!entry)
+		entry = load_plugin(name, flags);
+	return entry;
+}
+
+static void process_input_queue(freerdp* instance)
+{
+	wMessageQueue* queue = freerdp_get_message_queue(instance, FREERDP_INPUT_MESSAGE_QUEUE);
+	wMessage message;
+	if (!queue)
+		return;
+	while (MessageQueue_Peek(queue, &message, TRUE))
+	{
+		if (!freerdp_message_queue_process_message(instance, FREERDP_INPUT_MESSAGE_QUEUE, &message))
+			break;
+	}
+}
+
+static void send_resize(RDPSession* session)
+{
+	int width = 0;
+	int height = 0;
+	pthread_mutex_lock(&session->lock);
+	width = session->resizeWidth;
+	height = session->resizeHeight;
+	session->resizeWidth = 0;
+	session->resizeHeight = 0;
+	pthread_mutex_unlock(&session->lock);
+	if (width < 200 || height < 200)
+		return;
+	width &= ~1;
+	height &= ~1;
+	if (!session->disp || !session->disp->SendMonitorLayout)
+	{
+		if (!session->resizeNoteLogged)
+		{
+			session->resizeNoteLogged = 1;
+			log_line(session, "Сервер не меняет размер. Картинка подгоняется в окне.");
+		}
+		return;
+	}
+
+	DISPLAY_CONTROL_MONITOR_LAYOUT layout;
+	memset(&layout, 0, sizeof(layout));
+	layout.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
+	layout.Width = (UINT32)width;
+	layout.Height = (UINT32)height;
+	layout.DesktopScaleFactor = 100;
+	layout.DeviceScaleFactor = 100;
+	UINT result = session->disp->SendMonitorLayout(session->disp, 1, &layout);
+	char line[128];
+	snprintf(line, sizeof(line), "Запрошен размер %dx%d (%s).", width, height,
+	         result == CHANNEL_RC_OK ? "принято" : "ошибка");
+	log_line(session, line);
+}
+
+static int error_is_auth(UINT32 code)
+{
+	const char* name = freerdp_get_last_error_name(code);
+	const char* category = freerdp_get_last_error_category(code);
+	if (name && (strstr(name, "AUTH") || strstr(name, "LOGON") || strstr(name, "NLA")))
+		return 1;
+	if (category && strstr(category, "AUTH"))
+		return 1;
+	return 0;
+}
+
+static void* session_thread(void* argument)
+{
+	RDPSession* session = (RDPSession*)argument;
+	BOOL connected = freerdp_connect(session->instance);
+	if (!connected)
+	{
+		UINT32 code = freerdp_get_last_error(session->context);
+		const char* text = freerdp_get_last_error_string(code);
+		int fatal = session->certRejected || session->authFailed || error_is_auth(code);
+		if (session->handlers.disconnected)
+			session->handlers.disconnected(session->handlers.ctx, fatal, text ? text : "Нет соединения");
+		return nullptr;
+	}
+
+	HANDLE handles[32];
+	while (!session->stop && !freerdp_shall_disconnect_context(session->context))
+	{
+		DWORD count = 0;
+		handles[count++] = session->stopEvent;
+		HANDLE inputEvent =
+		    freerdp_get_message_queue_event_handle(session->instance, FREERDP_INPUT_MESSAGE_QUEUE);
+		if (inputEvent)
+			handles[count++] = inputEvent;
+		handles[count++] = session->resizeEvent;
+		DWORD extra = freerdp_get_event_handles(session->context, &handles[count], 32 - count);
+		if (extra == 0)
+			break;
+		count += extra;
+
+		DWORD waitResult = WaitForMultipleObjects(count, handles, FALSE, 1000);
+		if (session->stop || WaitForSingleObject(session->stopEvent, 0) == WAIT_OBJECT_0)
+			break;
+		if (waitResult == WAIT_FAILED)
+			break;
+		if (inputEvent && WaitForSingleObject(inputEvent, 0) == WAIT_OBJECT_0)
+			process_input_queue(session->instance);
+		if (WaitForSingleObject(session->resizeEvent, 0) == WAIT_OBJECT_0)
+			send_resize(session);
+		if (waitResult == WAIT_TIMEOUT)
+			continue;
+		if (!freerdp_check_event_handles(session->context))
+			break;
+	}
+
+	freerdp_disconnect(session->instance);
+	const char* reason = session->stop ? "Отключено" : "Соединение закрыто";
+	UINT32 code = freerdp_get_last_error(session->context);
+	const char* text = freerdp_get_last_error_string(code);
+	if (!session->stop && text && text[0] && strcmp(text, "Success") != 0 &&
+	    strcmp(text, "ERRINFO_SUCCESS") != 0)
+		reason = text;
+	int fatal = session->certRejected || session->authFailed;
+	if (session->handlers.disconnected)
+		session->handlers.disconnected(session->handlers.ctx, fatal, reason);
+	return nullptr;
+}
+
+static void apply_connection_settings(RDPSession* session)
+{
+	rdpSettings* settings = session->context->settings;
+	apply_graphics(settings, &session->params);
+	freerdp_settings_set_string(settings, FreeRDP_ServerHostname, session->params.host);
+	freerdp_settings_set_uint32(settings, FreeRDP_ServerPort, (UINT32)session->params.port);
+	freerdp_settings_set_string(settings, FreeRDP_Username, session->params.username);
+	freerdp_settings_set_string(settings, FreeRDP_Password, session->params.password);
+	freerdp_settings_set_string(settings, FreeRDP_Domain, "");
+}
+
+RDPSession* rdp_session_create(const RDPParams* params, const RDPHandlers* handlers)
+{
+	if (!params || !handlers)
+		return nullptr;
+	RDPSession* session = (RDPSession*)calloc(1, sizeof(RDPSession));
+	if (!session)
+		return nullptr;
+	session->params = *params;
+	session->handlers = *handlers;
+	pthread_mutex_init(&session->lock, nullptr);
+	session->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+	session->resizeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+	RDP_CLIENT_ENTRY_POINTS entry;
+	memset(&entry, 0, sizeof(entry));
+	client_entry(&entry);
+	session->context = freerdp_client_context_new(&entry);
+	if (!session->context)
+	{
+		rdp_session_destroy(session);
+		return nullptr;
+	}
+	session->instance = session->context->instance;
+	((DalnyContext*)session->context)->session = session;
+	snprintf(g_pluginDir, sizeof(g_pluginDir), "%s", params->pluginsDir);
+	g_previousProvider = freerdp_get_current_addin_provider();
+	freerdp_register_addin_provider(addin_provider, 0);
+	apply_connection_settings(session);
+	return session;
+}
+
+void rdp_session_start(RDPSession* session)
+{
+	if (!session || session->threadStarted)
+		return;
+	session->stop = 0;
+	ResetEvent(session->stopEvent);
+	if (pthread_create(&session->thread, nullptr, session_thread, session) == 0)
+		session->threadStarted = 1;
+}
+
+void rdp_session_stop(RDPSession* session)
+{
+	if (!session)
+		return;
+	session->stop = 1;
+	if (session->stopEvent)
+		SetEvent(session->stopEvent);
+	if (session->context)
+		freerdp_abort_connect_context(session->context);
+}
+
+void rdp_session_destroy(RDPSession* session)
+{
+	if (!session)
+		return;
+	rdp_session_stop(session);
+	if (session->threadStarted)
+	{
+		pthread_join(session->thread, nullptr);
+		session->threadStarted = 0;
+	}
+	if (session->context)
+	{
+		freerdp_client_context_free(session->context);
+		session->context = nullptr;
+		session->instance = nullptr;
+	}
+	if (session->clipboard)
+		ClipboardDestroy(session->clipboard);
+	free_server_formats(session);
+	free(session->pendingClipboard);
+	if (session->stopEvent)
+		CloseHandle(session->stopEvent);
+	if (session->resizeEvent)
+		CloseHandle(session->resizeEvent);
+	wipe_bytes(session->params.password, sizeof(session->params.password));
+	pthread_mutex_destroy(&session->lock);
+	free(session);
+}
+
+void rdp_session_send_scancode(RDPSession* session, uint32_t rdpScancode, int down, int repeat)
+{
+	if (!session || !session->instance || !session->instance->context || session->stop)
+		return;
+	rdpInput* input = session->instance->context->input;
+	if (!input)
+		return;
+	freerdp_input_send_keyboard_event_ex(input, down ? TRUE : FALSE, repeat ? TRUE : FALSE,
+	                                     rdpScancode);
+}
+
+void rdp_session_send_mouse(RDPSession* session, int x, int y, int button, int down)
+{
+	if (!session || !session->instance || !session->instance->context || session->stop)
+		return;
+	rdpInput* input = session->instance->context->input;
+	if (!input)
+		return;
+	if (x < 0)
+		x = 0;
+	if (y < 0)
+		y = 0;
+	UINT16 flags = PTR_FLAGS_MOVE;
+	if (button == 1)
+		flags = (UINT16)(PTR_FLAGS_BUTTON1 | (down ? PTR_FLAGS_DOWN : 0));
+	else if (button == 2)
+		flags = (UINT16)(PTR_FLAGS_BUTTON2 | (down ? PTR_FLAGS_DOWN : 0));
+	else if (button == 3)
+		flags = (UINT16)(PTR_FLAGS_BUTTON3 | (down ? PTR_FLAGS_DOWN : 0));
+	freerdp_input_send_mouse_event(input, flags, (UINT16)x, (UINT16)y);
+}
+
+void rdp_session_send_wheel(RDPSession* session, int wheelNotches)
+{
+	if (!session || !session->instance || !session->instance->context || session->stop ||
+	    wheelNotches == 0)
+		return;
+	rdpInput* input = session->instance->context->input;
+	if (!input)
+		return;
+	UINT16 flags = PTR_FLAGS_WHEEL;
+	int steps = wheelNotches;
+	if (steps < 0)
+	{
+		flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+		steps = -steps;
+	}
+	steps *= 120;
+	if (steps > 0xFF)
+		steps = 0xFF;
+	if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+		steps = 0x100 - steps;
+	freerdp_input_send_mouse_event(input, (UINT16)(flags | (steps & 0xFF)), 0, 0);
+}
+
+void rdp_session_request_resize(RDPSession* session, int width, int height)
+{
+	if (!session)
+		return;
+	pthread_mutex_lock(&session->lock);
+	session->resizeWidth = width;
+	session->resizeHeight = height;
+	pthread_mutex_unlock(&session->lock);
+	if (session->resizeEvent)
+		SetEvent(session->resizeEvent);
+}
+
+void rdp_session_set_clipboard_utf8(RDPSession* session, const char* utf8)
+{
+	if (!session || !utf8 || !session->params.clipboard)
+		return;
+	pthread_mutex_lock(&session->lock);
+	free(session->pendingClipboard);
+	session->pendingClipboard = _strdup(utf8);
+	if (session->clipboard && session->pendingClipboard)
+	{
+		UINT32 format = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
+		ClipboardSetData(session->clipboard, format, session->pendingClipboard,
+		                 (UINT32)strlen(session->pendingClipboard) + 1);
+		if (session->cliprdr)
+			clip_send_format_list(session);
+	}
+	pthread_mutex_unlock(&session->lock);
+}
+
+void rdp_session_remote_size(RDPSession* session, int* width, int* height)
+{
+	if (!session)
+		return;
+	if (width)
+		*width = session->remoteWidth;
+	if (height)
+		*height = session->remoteHeight;
+}

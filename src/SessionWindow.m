@@ -50,13 +50,6 @@ static void frame_thunk(void* ctx, const uint8_t* bgra, int width, int height, i
 static void resize_thunk(void* ctx, int width, int height);
 static void clipboard_thunk(void* ctx, const char* utf8);
 static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5);
-static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5)
-{
-	if (!dib || length == 0)
-		return;
-	[window_from(ctx) deliverClipboardImage:[NSData dataWithBytes:dib length:length] isV5:isV5 != 0];
-}
-
 static int cert_thunk(void* ctx, const char* fingerprint, int changed);
 static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 
@@ -891,6 +884,13 @@ static void resize_thunk(void* ctx, int width, int height)
 static void clipboard_thunk(void* ctx, const char* utf8)
 {
 	[window_from(ctx) deliverClipboard:utf8 ? @(utf8) : @""];
+}
+
+static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5)
+{
+	if (!dib || length == 0)
+		return;
+	[window_from(ctx) deliverClipboardImage:[NSData dataWithBytes:dib length:length] isV5:isV5 != 0];
 }
 
 static int cert_thunk(void* ctx, const char* fingerprint, int changed)

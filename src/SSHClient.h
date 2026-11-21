@@ -31,6 +31,18 @@ NS_ASSUME_NONNULL_BEGIN
                  askHost:(BOOL (^)(NSString* fingerprint, BOOL changed))askHost
                      log:(void (^)(NSString* line))log
                    error:(NSError* _Nullable* _Nullable)error;
+
+/* Runs a POSIX sh script on the server as the SSH user (no sudo). Key or password auth, same
+ * known_hosts rules as the tunnel. Returns stdout and stderr together, or nil on an SSH failure. */
++ (nullable NSString*)runScript:(NSString*)script
+                           host:(NSString*)host
+                           port:(int)port
+                       username:(NSString*)username
+                         keyPEM:(nullable NSString*)keyPEM
+                       password:(nullable NSString*)password
+                        askHost:(BOOL (^)(NSString* fingerprint, BOOL changed))askHost
+                            log:(void (^)(NSString* line))log
+                          error:(NSError* _Nullable* _Nullable)error;
 @end
 
 NS_ASSUME_NONNULL_END

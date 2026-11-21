@@ -24,8 +24,8 @@ The app name is **Дальний** (bundle id `app.dalny.client`, executable `Da
 - Graphics profiles: Economy, Balanced, Quality, plus fixed resolution, fit-to-window, or fullscreen. Stock xrdp 0.9.24 does not negotiate GFX or H.264. Profiles use RemoteFX, resolution, bits per pixel, and desktop-effect flags. Do not embed OpenH264 or FFmpeg.
 - Bits per pixel stay stable per server. xrdp allocates a session per user and color depth. Changing 16↔32 opens a different desktop. The editor warns about that.
 - Auto-reconnect is app-level: detect a dead link, back off, read the Keychain again, rebuild the SSH tunnel, log in again. FreeRDP’s reconnect cookie is not enough on xrdp 0.9 and is disabled. Do not set `KillDisconnected=true` on the server.
-- Clipboard text is on by default.
-- Keyboard: scancodes, US layout `0x00000409`, language switch on the remote session. Do not use Unicode keyboard mode with xrdp. The Mac input source should stay ABC/US while the session is focused. Command maps to Ctrl by default. ISO Mac keyboards swap grave and section.
+- Clipboard is on by default: text (Unicode) and pictures both ways over `cliprdr`. Files are not supported.
+- Keyboard: scancodes, US layout `0x00000409`, language switch on the remote session (XKB `grp:alt_shift_toggle`, layouts `us,ru`). The session window has an **RU/EN** button with the hint «Язык: ⌥ Option + ⇧ Shift» in the title bar (top right). Menu **Подключение → Переключить язык (RU/EN)**, shortcut ⌘⇧Space (⌃Space is the macOS input-source switch). Both send left Alt + left Shift press/release. Physical Option+Shift is forwarded as LMENU+LSHIFT scancodes. Do not use Unicode keyboard mode with xrdp. The Mac input source should stay ABC/US while the session is focused. Command maps to Ctrl by default. ISO Mac keyboards swap grave and section.
 - Russian UI.
 - Export/import of one server entry without the password or private key. A certificate fingerprint may be included.
 - SSH tunnel on by default for new servers. Local forward to `127.0.0.1` only. Key or password auth. Secrets in the Keychain. Restart the tunnel on reconnect.
@@ -54,6 +54,8 @@ src/ServerStore.m          ~/Library/Application Support/Dalny/servers.json
 src/Keychain.m             SecItem generic passwords, legacy fallback on -34018
 src/DalnyLog.m             Copyable journal
 src/Updater.m              GitHub Release check, verify, replace, relaunch
+src/ClipboardImage.m       NSPasteboard PNG/TIFF <-> CF_DIB (24-bit BI_RGB out, any BMP in)
+src/LanguageSetup.m        One-click server language setup over SSH, no root
 src/ServerEditor.m         Short form plus Дополнительно; SSH key create/copy/install
 src/SSHClient.m            ssh-keygen, ssh-keyscan, known_hosts, local forward, askpass
 src/askpass.c              SSH_ASKPASS helper inside Contents/MacOS
@@ -76,7 +78,7 @@ Connection path when SSH is on (the default):
 4. On drop, path change, or tunnel death: kill SSH, abort FreeRDP, back off, read the Keychain again, repeat.
 5. Authentication failure, a rejected host key, or a rejected certificate stops the loop.
 
-FreeRDP channels are built into `libfreerdp-client3` (static table). A small provider asks that table first and then falls back to `dlopen` of `lib<name>-client.dylib` in `Contents/Frameworks`. Clipboard text uses `cliprdr`. Dynamic resize uses `disp` when the server offers it.
+FreeRDP channels are built into `libfreerdp-client3` (static table). A small provider asks that table first and then falls back to `dlopen` of `lib<name>-client.dylib` in `Contents/Frameworks`. Clipboard text and pictures use `cliprdr` (`-DCHANNEL_CLIPRDR=ON` is explicit in the build and `check-tree.sh` checks it; `verify-bundle.sh` checks the channel is linked). Dynamic resize uses `disp` when the server offers it.
 
 ## How the CI build works
 
@@ -105,9 +107,28 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 - `PRE_CONNECT_FAILED` and `POST_CONNECT_FAILED` stop auto-reconnect.
 - A wrong login or password (RDP `AUTHENTICATION_FAILED`, `LOGON_FAILURE`, `WRONG_PASSWORD`, `NO_OR_MISSING_CREDENTIALS`, a failed logon info from the server, or SSH `Permission denied`, error code 4) stops the loop and opens a dialog to re-enter the user name and password. The dialog saves them to the Keychain and reconnects. A rejected SSH key only shows a notice. xrdp 0.9 without NLA may show its own login screen instead of returning an error; that case shows up inside the session.
 
+### Added in 1.0.5
+
+- Language switch button and menu item (see Requirements → Keyboard). `RDPView` lets ⌘⇧Space go to the menu. `sendLanguageToggle` first releases every key the server still holds, so the server sees exactly Alt+Shift.
+- `windowDidResignKey` releases all keys on the server. Before, ⌘Tab left Ctrl (from Command) held on the server, and the next Option+Shift arrived as Ctrl+Alt+Shift and did not switch.
+- **Подключение → Настроить переключение языка на сервере…** (session window or the selected server in the list). Runs a POSIX `sh` script over SSH as the SSH user (`SSHClient runScript:`, base64 on the command line, same `known_hosts` rules, key or password from the Keychain). No sudo. The script:
+  - finds the user's X display from `/proc/<pid>/environ` of the user's own processes (prefers `:10` and up and a process with `DBUS_SESSION_BUS_ADDRESS`);
+  - XFCE: `xfconf-query -c keyboard-layout` sets `/Default/XkbDisable false`, `/Default/XkbLayout us,ru`, `/Default/XkbVariant ,`, `/Default/XkbOptions/Group grp:alt_shift_toggle` (`-n -t`, then without them if the property exists). With no session bus and no `xfconfd`, it writes `keyboard-layout.xml` instead (old file kept as `.dalny-backup`);
+  - `setxkbmap -layout us,ru -variant , -option grp:alt_shift_toggle` on that display;
+  - prints `DALNY_DISPLAY=`, `DALNY_XFCONF=ok|file|skip|fail`, `DALNY_SETXKBMAP=ok|nodisplay|missing|fail`. The app logs every line and shows an alert.
+- After the first frame of a session, if SSH is on and the server field `languageSetup` is empty, a sheet asks once. The answer (`done` / `declined`) is saved in `servers.json`; it is not exported.
+- Manual commands for XFCE and for other desktops are in the README («Переключение языка на сервере»).
+- Picture clipboard:
+  - Mac → server: the 0.5 s pasteboard poll reads PNG or TIFF (not when a file URL is present: Finder also puts the file icon there), draws it on white, and writes a 24-bit bottom-up `BITMAPINFOHEADER` DIB. The format list offers WinPR's text formats plus `CF_DIB`. A `CF_DIB` request is answered from that buffer. xrdp 0.9.24 shows it to X as `image/bmp`. Limit 20 megapixels / 64 MB.
+  - Server → Mac: when the server list has no text format, the client asks for `CF_DIB` (or `CF_DIBV5`), adds a 14-byte BMP file header (offset from header size, masks and palette), decodes it with `NSBitmapImageRep` and puts PNG and TIFF on the pasteboard. Text still wins when both are offered.
+  - A new session offers the current Mac clipboard right away. The pasteboard timer keeps running across reconnects (before, it stopped after the first reconnect).
+  - The session window clears `RDPView.session` synchronously on the main thread before freeing the session.
+- Files: not supported. It needs `FileGroupDescriptorW` plus `FileContents` streaming and, on xrdp 0.9, FUSE in chansrv. Use SFTP over the same SSH.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.
+- No file copy through the clipboard. Pictures only through `image/bmp` on the X side.
 - Changing 16-bit vs 32-bit color starts a different xrdp session.
 - Unicode keyboard mode is intentionally absent.
 - The build is ad-hoc signed and not notarized.

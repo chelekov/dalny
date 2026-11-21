@@ -300,8 +300,33 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 	[self sendKey:event down:NO];
 }
 
++ (BOOL)isLanguageShortcut:(NSEvent*)event
+{
+	if (event.type != NSEventTypeKeyDown || event.keyCode != 49) /* kVK_Space */
+		return NO;
+	NSEventModifierFlags mods = event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagShift |
+	                                                   NSEventModifierFlagOption | NSEventModifierFlagControl);
+	return mods == (NSEventModifierFlagCommand | NSEventModifierFlagShift);
+}
+
+- (void)sendLanguageToggle
+{
+	if (!self.session)
+		return;
+	for (NSNumber* key in [_scancodeDown allKeys])
+		rdp_session_send_scancode(self.session, key.unsignedIntValue, 0, 0);
+	[_scancodeDown removeAllObjects];
+	/* Keys still held on the Mac count as already handled: releasing them sends nothing. */
+	_previousFlags = (NSEventModifierFlags)CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & (kFlagLShift | kFlagRShift | kFlagLCmd | kFlagRCmd | kFlagLAlt |
+	                                            kFlagRAlt | kFlagLCtl | kFlagRCtl | NSEventModifierFlagCapsLock);
+	rdp_session_send_language_toggle(self.session);
+}
+
 - (BOOL)performKeyEquivalent:(NSEvent*)event
 {
+	/* Leave the language shortcut to the menu item. */
+	if ([RDPView isLanguageShortcut:event])
+		return NO;
 	if (!self.mapCommandToControl || !(event.modifierFlags & NSEventModifierFlagCommand))
 		return NO;
 	if (event.type == NSEventTypeKeyDown)

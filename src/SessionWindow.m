@@ -1,5 +1,7 @@
 #import "SessionWindow.h"
+#import "ClipboardImage.h"
 #import "DalnyLog.h"
+#import "LanguageSetup.h"
 #import "Keychain.h"
 #import "RDPView.h"
 #import "SSHClient.h"
@@ -38,6 +40,8 @@
 	BOOL _credentialsRejected;
 	BOOL _started;
 	NSString* _lastReason;
+	BOOL _sawFrame;
+	BOOL _languageOfferShown;
 }
 
 static void log_thunk(void* ctx, const char* line);
@@ -45,6 +49,14 @@ static void frame_thunk(void* ctx, const uint8_t* bgra, int width, int height, i
                         int h);
 static void resize_thunk(void* ctx, int width, int height);
 static void clipboard_thunk(void* ctx, const char* utf8);
+static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5);
+static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5)
+{
+	if (!dib || length == 0)
+		return;
+	[window_from(ctx) deliverClipboardImage:[NSData dataWithBytes:dib length:length] isV5:isV5 != 0];
+}
+
 static int cert_thunk(void* ctx, const char* fingerprint, int changed);
 static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 
@@ -78,7 +90,7 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	_status = [NSTextField wrappingLabelWithString:@"Подключение…"];
 	_status.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
 	_status.translatesAutoresizingMaskIntoConstraints = NO;
-	_hint = [NSTextField wrappingLabelWithString:@"Раскладка Mac: ABC. На сервере язык переключается Option+Shift."];
+	_hint = [NSTextField wrappingLabelWithString:@"Раскладка Mac: ABC. На сервере язык переключается ⌥ Option + ⇧ Shift или кнопкой RU/EN."];
 	_hint.font = [NSFont systemFontOfSize:12];
 	_hint.textColor = NSColor.secondaryLabelColor;
 	_hint.translatesAutoresizingMaskIntoConstraints = NO;
@@ -102,6 +114,8 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	_logView.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
 	_logScroll.translatesAutoresizingMaskIntoConstraints = NO;
 	_logScroll.hidden = YES;
+
+	[self buildLanguageAccessory];
 
 	NSView* content = self.window.contentView;
 	[content addSubview:_status];
@@ -127,6 +141,98 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		[_logScroll.heightAnchor constraintEqualToConstant:140],
 		[_view.bottomAnchor constraintEqualToAnchor:_logScroll.topAnchor constant:-8]
 	]];
+}
+
+// Top-right corner of the title bar: hint plus the RU/EN button.
+- (void)buildLanguageAccessory
+{
+	NSTextField* label = [NSTextField labelWithString:@"Язык: ⌥ Option + ⇧ Shift"];
+	label.font = [NSFont systemFontOfSize:11];
+	label.textColor = NSColor.secondaryLabelColor;
+	label.toolTip = @"На сервере русский и английский переключаются ⌥ Option + ⇧ Shift. Ещё: кнопка RU/EN или ⌘⇧Пробел.";
+	NSButton* button = [NSButton buttonWithTitle:@"RU/EN" target:self action:@selector(switchLanguage:)];
+	button.bezelStyle = NSBezelStyleRounded;
+	button.controlSize = NSControlSizeSmall;
+	button.font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]
+	                                weight:NSFontWeightSemibold];
+	button.refusesFirstResponder = YES;
+	button.toolTip = @"Переключить язык на сервере (отправляет ⌥ Option + ⇧ Shift). Сочетание на Маке: ⌘⇧Пробел.";
+	[label sizeToFit];
+	[button sizeToFit];
+	CGFloat height = 28;
+	CGFloat gap = 8;
+	CGFloat width = label.frame.size.width + gap + button.frame.size.width + 10;
+	NSView* holder = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+	label.frame = NSMakeRect(0, (height - label.frame.size.height) / 2.0, label.frame.size.width, label.frame.size.height);
+	button.frame = NSMakeRect(NSMaxX(label.frame) + gap, (height - button.frame.size.height) / 2.0,
+	                          button.frame.size.width, button.frame.size.height);
+	[holder addSubview:label];
+	[holder addSubview:button];
+	NSTitlebarAccessoryViewController* accessory = [NSTitlebarAccessoryViewController new];
+	accessory.view = holder;
+	accessory.layoutAttribute = NSLayoutAttributeRight;
+	[self.window addTitlebarAccessoryViewController:accessory];
+}
+
+- (void)switchLanguage:(id)sender
+{
+	(void)sender;
+	if (!_rdp || !_view.session)
+	{
+		NSBeep();
+		return;
+	}
+	[_view sendLanguageToggle];
+	[self.window makeFirstResponder:_view];
+	[self appendLog:@"Отправил на сервер ⌥ Option + ⇧ Shift (переключение языка)."];
+}
+
+- (void)configureServerLanguage:(id)sender
+{
+	(void)sender;
+	__weak typeof(self) weakSelf = self;
+	[LanguageSetup runInteractiveForServer:_server
+	                                window:self.window
+	                                   log:^(NSString* line) {
+		                                   [weakSelf appendLog:line];
+	                                   }];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem*)item
+{
+	if (item.action == @selector(switchLanguage:))
+		return _rdp != NULL && _view.session != NULL;
+	return YES;
+}
+
+// Once per server, after the first picture of a session arrives: offer the server setup.
+- (void)maybeOfferLanguageSetup
+{
+	if (_languageOfferShown || _server.languageSetup.length > 0 || !_server.sshEnabled || _cancelled)
+		return;
+	_languageOfferShown = YES;
+	NSAlert* alert = [NSAlert new];
+	alert.messageText = @"Настроить переключение языка на сервере?";
+	alert.informativeText = @"Дальний по SSH, без sudo, включит на сервере раскладки us и ru и переключение ⌥ Option + ⇧ Shift (настройки XFCE и текущий сеанс). Это можно сделать и позже: меню «Подключение» → «Настроить переключение языка на сервере…».";
+	[alert addButtonWithTitle:@"Настроить"];
+	[alert addButtonWithTitle:@"Не надо"];
+	__weak typeof(self) weakSelf = self;
+	[alert beginSheetModalForWindow:self.window
+	              completionHandler:^(NSModalResponse response) {
+		              typeof(self) strongSelf = weakSelf;
+		              if (!strongSelf)
+			              return;
+		              BOOL yes = response == NSAlertFirstButtonReturn;
+		              strongSelf->_server.languageSetup = yes ? @"done" : @"declined";
+		              [[ServerStore sharedStore] save];
+		              [strongSelf.window makeFirstResponder:strongSelf->_view];
+		              if (yes)
+			              dispatch_async(dispatch_get_main_queue(), ^{
+				              [strongSelf configureServerLanguage:nil];
+			              });
+		              else
+			              [strongSelf appendLog:@"Настройку языка на сервере не делаю. Её можно запустить из меню «Подключение»."];
+	              }];
 }
 
 - (void)startPathMonitor
@@ -219,8 +325,8 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	CFRelease(source);
 	BOOL cyrillic = [identifier rangeOfString:@"Russian" options:NSCaseInsensitiveSearch].location != NSNotFound;
 	_hint.stringValue = cyrillic
-	    ? @"Сейчас на Mac включена русская раскладка. Переключите Mac на ABC, иначе буквы поедут. Язык внутри сервера — это Option+Shift."
-	    : @"Раскладка Mac: ABC. На сервере русский и английский переключаются Option+Shift.";
+	    ? @"Сейчас на Mac включена русская раскладка. Переключите Mac на ABC, иначе буквы поедут. Язык внутри сервера — это ⌥ Option + ⇧ Shift."
+	    : @"Раскладка Mac: ABC. На сервере русский и английский переключаются ⌥ Option + ⇧ Shift или кнопкой RU/EN.";
 	_hint.textColor = cyrillic ? NSColor.systemOrangeColor : NSColor.secondaryLabelColor;
 }
 
@@ -504,6 +610,7 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		handlers.frame = frame_thunk;
 		handlers.resized = resize_thunk;
 		handlers.clipboard_text = clipboard_thunk;
+		handlers.clipboard_image = clipboard_image_thunk;
 		handlers.ask_certificate = cert_thunk;
 		handlers.disconnected = disconnect_thunk;
 
@@ -515,7 +622,10 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 			[self setStatus:lastReason];
 			break;
 		}
+		self->_sawFrame = NO;
 		dispatch_async(dispatch_get_main_queue(), ^{
+			/* Offer what is on the Mac clipboard now to the new session. */
+			self->_pasteboardBaseline = -1;
 			self->_view.session = self->_rdp;
 			[self.window makeFirstResponder:self->_view];
 			[self checkKeyboardLayout];
@@ -533,10 +643,11 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		}
 		RDPSession* finished = _rdp;
 		_rdp = NULL;
-		dispatch_async(dispatch_get_main_queue(), ^{
+		/* Synchronous: the view, the pasteboard timer and the menu must stop using the session
+		 * before it is freed. */
+		dispatch_sync(dispatch_get_main_queue(), ^{
+			[self->_view releaseAllKeys];
 			self->_view.session = nil;
-			[self->_pasteboardTimer invalidate];
-			self->_pasteboardTimer = nil;
 		});
 		rdp_session_destroy(finished);
 		[_tunnel stop];
@@ -583,6 +694,14 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	[_view updateFrameWithBytes:bytes width:width height:height stride:stride];
 	_remoteWidth = width;
 	_remoteHeight = height;
+	if (!_sawFrame)
+	{
+		_sawFrame = YES;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+			if (self->_rdp && !self.window.attachedSheet)
+				[self maybeOfferLanguageSetup];
+		});
+	}
 }
 
 - (void)noteResizeWidth:(int)width height:(int)height
@@ -601,6 +720,22 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		[pasteboard clearContents];
 		[pasteboard setString:text forType:NSPasteboardTypeString];
 		self->_pasteboardBaseline = pasteboard.changeCount;
+	});
+}
+
+- (void)deliverClipboardImage:(NSData*)dib isV5:(BOOL)isV5
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+		if ([ClipboardImage writeDIB:dib toPasteboard:pasteboard])
+		{
+			self->_pasteboardBaseline = pasteboard.changeCount;
+			[self appendLog:[NSString stringWithFormat:@"Картинка с сервера в буфере Мака (%@, %lu КБ).",
+			                                           isV5 ? @"CF_DIBV5" : @"CF_DIB",
+			                                           (unsigned long)(dib.length / 1024)]];
+		}
+		else
+			[self appendLog:@"Сервер прислал картинку, но её не удалось прочитать."];
 	});
 }
 
@@ -649,13 +784,29 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		return;
 	_pasteboardBaseline = pasteboard.changeCount;
 	NSString* text = [pasteboard stringForType:NSPasteboardTypeString];
-	if (text)
-		rdp_session_set_clipboard_utf8(_rdp, text.UTF8String);
+	NSString* reason = nil;
+	/* 20 megapixels is about 60 MB as 24-bit DIB, under the 64 MB channel limit. */
+	NSData* dib = [ClipboardImage dibFromPasteboard:pasteboard maxPixels:20000000 reason:&reason];
+	if (reason)
+		[self appendLog:reason];
+	if (!text && !dib)
+		return;
+	rdp_session_set_clipboard(_rdp, text.UTF8String, dib.bytes, dib.length);
+	if (dib)
+		[self appendLog:[NSString stringWithFormat:@"Картинка из буфера Мака передана серверу (%lu КБ).",
+		                                           (unsigned long)(dib.length / 1024)]];
 }
 
 - (void)windowDidBecomeKey:(NSNotification*)notification
 {
 	[self checkKeyboardLayout];
+}
+
+// Cmd+Tab and similar leave the window with modifiers down on the server (Ctrl from Command,
+// Alt, Shift). A stuck modifier breaks Option+Shift later, so release everything here.
+- (void)windowDidResignKey:(NSNotification*)notification
+{
+	[_view releaseAllKeys];
 }
 
 - (void)windowDidEndLiveResize:(NSNotification*)notification

@@ -25,6 +25,7 @@
 	server.sshAuth = @"password";
 	server.sshPublicKey = @"";
 	server.certFingerprint = @"";
+	server.languageSetup = @"";
 	return server;
 }
 
@@ -71,6 +72,7 @@
 	server.sshAuth = [server string:dictionary[@"sshAuth"] fallback:@"key"];
 	server.sshPublicKey = [server string:dictionary[@"sshPublicKey"] fallback:@""];
 	server.certFingerprint = [server string:dictionary[@"certFingerprint"] fallback:@""];
+	server.languageSetup = [server string:dictionary[@"languageSetup"] fallback:@""];
 	if (server.host.length == 0)
 		return nil;
 	return server;
@@ -98,7 +100,8 @@
 		@"sshUsername" : self.sshUsername ?: @"",
 		@"sshAuth" : self.sshAuth ?: @"key",
 		@"sshPublicKey" : self.sshPublicKey ?: @"",
-		@"certFingerprint" : self.certFingerprint ?: @""
+		@"certFingerprint" : self.certFingerprint ?: @"",
+		@"languageSetup" : self.languageSetup ?: @""
 	};
 }
 
@@ -107,6 +110,7 @@
 	NSMutableDictionary* copy = [[self dictionaryRepresentation] mutableCopy];
 	[copy removeObjectForKey:@"id"];
 	[copy removeObjectForKey:@"sshPublicKey"];
+	[copy removeObjectForKey:@"languageSetup"];
 	return @{@"kind" : @"dalny-server", @"version" : @1, @"server" : copy};
 }
 

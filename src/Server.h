@@ -23,6 +23,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy) NSString* sshAuth;
 @property(nonatomic, copy) NSString* sshPublicKey;
 @property(nonatomic, copy) NSString* certFingerprint;
+/* Language switch setup on the server: "" not asked yet, "done", "declined". */
+@property(nonatomic, copy) NSString* languageSetup;
 
 + (instancetype)newServer;
 - (NSDictionary*)dictionaryRepresentation;

@@ -35,4 +35,21 @@ if ! grep -q 'app.dalny.client' src/Updater.m; then
 	exit 1
 fi
 
+# The clipboard channel must be built into FreeRDP (text and pictures go through cliprdr).
+if ! grep -q -- '-DCHANNEL_CLIPRDR=ON' scripts/build-macos.sh; then
+	echo "build-macos.sh must build the cliprdr channel" >&2
+	exit 1
+fi
+
+if ! grep -q 'CF_DIB' src/session.mm || ! grep -q 'rdp_session_send_language_toggle' src/session.mm; then
+	echo "session.mm is missing picture clipboard or the language toggle" >&2
+	exit 1
+fi
+
+# Language setup runs as the SSH user. It must never ask for root.
+if grep -n -w 'sudo' src/LanguageSetup.m; then
+	echo "LanguageSetup.m must not use sudo" >&2
+	exit 1
+fi
+
 echo "tree ok"

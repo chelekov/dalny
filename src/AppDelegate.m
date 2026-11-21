@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "DalnyLog.h"
 #import "Keychain.h"
+#import "LanguageSetup.h"
 #import "Updater.h"
 #import "ServerEditor.h"
 #import "ServerStore.h"
@@ -55,6 +56,21 @@
 	[fileMenu addItemWithTitle:@"Подключиться" action:@selector(connect:) keyEquivalent:@"\r"];
 	fileItem.submenu = fileMenu;
 	[main addItem:fileItem];
+
+	/* Session commands go down the responder chain to the key session window. The setup item
+	 * also works from the server list for the selected server. */
+	NSMenuItem* sessionItem = [NSMenuItem new];
+	NSMenu* sessionMenu = [[NSMenu alloc] initWithTitle:@"Подключение"];
+	NSMenuItem* toggle = [sessionMenu addItemWithTitle:@"Переключить язык (RU/EN)"
+	                                            action:@selector(switchLanguage:)
+	                                     keyEquivalent:@" "];
+	toggle.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+	toggle.toolTip = @"Отправляет на сервер ⌥ Option + ⇧ Shift. Можно и просто нажать ⌥ Option + ⇧ Shift.";
+	[sessionMenu addItemWithTitle:@"Настроить переключение языка на сервере…"
+	                       action:@selector(configureServerLanguage:)
+	                keyEquivalent:@""];
+	sessionItem.submenu = sessionMenu;
+	[main addItem:sessionItem];
 
 	NSMenuItem* editItem = [NSMenuItem new];
 	NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Правка"];
@@ -232,6 +248,26 @@
 	SessionWindow* session = [[SessionWindow alloc] initWithServer:server];
 	[_sessions addObject:session];
 	[session showWindow:nil];
+}
+
+- (void)configureServerLanguage:(id)sender
+{
+	DalnyServer* server = [self selectedServer];
+	if (!server)
+	{
+		NSAlert* alert = [NSAlert new];
+		alert.messageText = @"Выберите сервер";
+		alert.informativeText = @"Выделите сервер в списке или откройте окно его сеанса.";
+		[alert runModal];
+		return;
+	}
+	[LanguageSetup runInteractiveForServer:server
+	                                window:_window
+	                                   log:^(NSString* line) {
+		                                   [DalnyLog append:line];
+	                                   }];
+	server.languageSetup = @"done";
+	[[ServerStore sharedStore] save];
 }
 
 - (void)sessionFinished:(NSNotification*)notification

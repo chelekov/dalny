@@ -37,6 +37,8 @@ typedef struct RDPHandlers
 	              int w, int h);
 	void (*resized)(void* ctx, int width, int height);
 	void (*clipboard_text)(void* ctx, const char* utf8);
+	/* Server copied a picture. dib is CF_DIB or CF_DIBV5 data (header plus pixels, no file header). */
+	void (*clipboard_image)(void* ctx, const uint8_t* dib, size_t length, int isV5);
 	int (*ask_certificate)(void* ctx, const char* fingerprint, int changed);
 	void (*disconnected)(void* ctx, int fatal, const char* reason);
 } RDPHandlers;
@@ -53,6 +55,12 @@ void rdp_session_send_mouse(RDPSession* session, int x, int y, int button, int d
 void rdp_session_send_wheel(RDPSession* session, int wheelNotches);
 void rdp_session_request_resize(RDPSession* session, int width, int height);
 void rdp_session_set_clipboard_utf8(RDPSession* session, const char* utf8);
+/* Mac clipboard for the server. utf8 and dib may be NULL. dib is CF_DIB data
+   (BITMAPINFOHEADER plus pixels). Both may be offered at once. */
+void rdp_session_set_clipboard(RDPSession* session, const char* utf8, const uint8_t* dib,
+                               size_t dibLength);
+/* Alt(left)+Shift(left) press and release: the XKB grp:alt_shift_toggle language switch. */
+void rdp_session_send_language_toggle(RDPSession* session);
 void rdp_session_remote_size(RDPSession* session, int* width, int* height);
 
 #ifdef __cplusplus

@@ -113,7 +113,7 @@
 	_bppWarning.preferredMaxLayoutWidth = 460;
 	_mapCommand = [NSButton checkboxWithTitle:@"Клавиша ⌘ работает как Ctrl" target:nil action:NULL];
 	_reconnect = [NSButton checkboxWithTitle:@"Переподключаться само, если связь пропала" target:nil action:NULL];
-	_clipboard = [NSButton checkboxWithTitle:@"Общий буфер обмена (текст)" target:nil action:NULL];
+	_clipboard = [NSButton checkboxWithTitle:@"Общий буфер обмена (текст и картинки)" target:nil action:NULL];
 	_sshEnabled = [NSButton checkboxWithTitle:@"Входить через SSH-туннель (так безопаснее)" target:self
 	                                   action:@selector(sshToggled:)];
 	_sshHost = [self input];

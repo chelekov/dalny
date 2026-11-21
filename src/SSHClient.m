@@ -53,6 +53,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	NSString* _secretPath;
 	NSString* _keyPath;
 	NSMutableString* _stderrText;
+	BOOL _captureStdout;
 }
 
 + (NSURL*)supportFolder
@@ -589,6 +590,8 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 			if (devnull > 2)
 				close(devnull);
 		}
+		if (_captureStdout)
+			dup2(pipefd[1], STDOUT_FILENO);
 		close(pipefd[0]);
 		close(pipefd[1]);
 		if (password.length)
@@ -825,6 +828,89 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	if (log)
 		log(@"Ключ записан в ~/.ssh/authorized_keys на сервере.");
 	return YES;
+}
+
++ (NSString*)runScript:(NSString*)script
+                  host:(NSString*)host
+                  port:(int)port
+              username:(NSString*)username
+                keyPEM:(NSString*)keyPEM
+              password:(NSString*)password
+               askHost:(BOOL (^)(NSString* fingerprint, BOOL changed))askHost
+                   log:(void (^)(NSString* line))log
+                 error:(NSError**)error
+{
+	if (![self confirmHost:host port:port changed:NO askHost:askHost log:log error:error])
+		return nil;
+	/* The script travels as base64 so no shell quoting is involved on either side. */
+	NSString* encoded = [[script dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+	NSString* command = [NSString stringWithFormat:@"echo %@ | base64 -d | sh", encoded];
+	SSHClient* client = [SSHClient new];
+	client->_captureStdout = YES;
+	NSMutableArray* args = [[client commonOptionsForHost:host port:port] mutableCopy];
+	if (keyPEM.length)
+	{
+		if (![client writeKey:keyPEM error:error])
+			return nil;
+		[args addObjectsFromArray:@[ @"-i", client->_keyPath, @"-o", @"PreferredAuthentications=publickey" ]];
+	}
+	else
+	{
+		[args addObjectsFromArray:@[ @"-o", @"PreferredAuthentications=password", @"-o", @"PubkeyAuthentication=no" ]];
+	}
+	[args addObjectsFromArray:@[ [NSString stringWithFormat:@"%@@%@", username, host], command ]];
+	int fd = -1;
+	if (![client launchSSHWithArguments:args password:keyPEM.length ? nil : password stderrOut:&fd error:error])
+	{
+		[client stop];
+		return nil;
+	}
+	NSMutableData* output = [NSMutableData data];
+	int status = 0;
+	BOOL finished = NO;
+	char buffer[4096];
+	for (int i = 0; i < 600; i++)
+	{
+		ssize_t count;
+		while ((count = read(fd, buffer, sizeof(buffer))) > 0)
+			[output appendBytes:buffer length:(NSUInteger)count];
+		pid_t waited = waitpid(client->_pid, &status, WNOHANG);
+		if (waited == client->_pid)
+		{
+			finished = YES;
+			break;
+		}
+		usleep(100000);
+	}
+	if (finished)
+	{
+		ssize_t count;
+		while ((count = read(fd, buffer, sizeof(buffer))) > 0)
+			[output appendBytes:buffer length:(NSUInteger)count];
+		client->_pid = 0;
+	}
+	close(fd);
+	[client stop];
+	NSString* text = [[NSString alloc] initWithData:output encoding:NSUTF8StringEncoding]
+	    ?: [[NSString alloc] initWithData:output encoding:NSISOLatin1StringEncoding] ?: @"";
+	if (!finished)
+	{
+		if (error)
+			*error = SSHError(3, @"Сервер SSH не закончил команду за 60 секунд.");
+		return nil;
+	}
+	int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	if (exitCode == 255 || exitCode < 0)
+	{
+		if (error)
+		{
+			BOOL denied = [text rangeOfString:@"Permission denied" options:NSCaseInsensitiveSearch].location != NSNotFound;
+			BOOL hostKey = [text rangeOfString:@"host key" options:NSCaseInsensitiveSearch].location != NSNotFound;
+			*error = SSHError(hostKey ? 2 : (denied ? 4 : 3), SSHFailureMessage(text, exitCode, @"Команда SSH не выполнилась."));
+		}
+		return nil;
+	}
+	return text;
 }
 
 - (void)dealloc

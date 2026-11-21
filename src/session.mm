@@ -63,6 +63,8 @@ struct RDPSession
 	UINT32 serverFormatCount;
 	UINT32 requestedFormatId;
 	char* pendingClipboard;
+	BYTE* pendingDib;
+	UINT32 pendingDibLength;
 
 	DispClientContext* disp;
 	int resizeNoteLogged;
@@ -369,34 +371,61 @@ static void free_server_formats(RDPSession* session)
 	session->serverFormatCount = 0;
 }
 
+/* Largest picture accepted either way: 64 MB of DIB data. */
+#define DALNY_CLIP_MAX_DIB (64u * 1024u * 1024u)
+
+/* Put pendingClipboard (text) into the WinPR clipboard, or empty it. Caller holds the lock. */
+static void clip_load_text(RDPSession* session)
+{
+	if (!session->clipboard)
+		return;
+	ClipboardEmpty(session->clipboard);
+	if (session->pendingClipboard)
+	{
+		UINT32 format = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
+		ClipboardSetData(session->clipboard, format, session->pendingClipboard,
+		                 (UINT32)strlen(session->pendingClipboard) + 1);
+	}
+}
+
+/* Text formats come from WinPR (it adds CF_UNICODETEXT, CF_TEXT, ...). A picture is offered as
+ * CF_DIB, which xrdp 0.9 turns into image/bmp for X applications. Caller holds the lock. */
 static UINT clip_send_format_list(RDPSession* session)
 {
 	if (!session->cliprdr || !session->clipboard)
 		return CHANNEL_RC_OK;
 
 	UINT32* ids = nullptr;
-	UINT32 count = ClipboardGetFormatIds(session->clipboard, &ids);
-	CLIPRDR_FORMAT* formats =
-	    (CLIPRDR_FORMAT*)calloc(count > 0 ? count : 1, sizeof(CLIPRDR_FORMAT));
+	UINT32 count = session->pendingClipboard ? ClipboardGetFormatIds(session->clipboard, &ids) : 0;
+	CLIPRDR_FORMAT* formats = (CLIPRDR_FORMAT*)calloc(count + 1, sizeof(CLIPRDR_FORMAT));
 	if (!formats)
 	{
 		free(ids);
 		return CHANNEL_RC_NO_MEMORY;
 	}
+	UINT32 used = 0;
 	for (UINT32 i = 0; i < count; i++)
 	{
-		formats[i].formatId = ids[i];
+		if (ids[i] == CF_DIB || ids[i] == CF_DIBV5)
+			continue;
+		formats[used].formatId = ids[i];
 		const char* name = ClipboardGetFormatName(session->clipboard, ids[i]);
 		if (ids[i] > CF_MAX && name)
-			formats[i].formatName = _strdup(name);
+			formats[used].formatName = _strdup(name);
+		used++;
+	}
+	if (session->pendingDib && session->pendingDibLength > 0)
+	{
+		formats[used].formatId = CF_DIB;
+		used++;
 	}
 
 	CLIPRDR_FORMAT_LIST list = {};
 	list.common.msgType = CB_FORMAT_LIST;
-	list.numFormats = count;
+	list.numFormats = used;
 	list.formats = formats;
 	UINT result = session->cliprdr->ClientFormatList(session->cliprdr, &list);
-	for (UINT32 i = 0; i < count; i++)
+	for (UINT32 i = 0; i < used; i++)
 		free(formats[i].formatName);
 	free(formats);
 	free(ids);
@@ -420,15 +449,10 @@ static UINT clip_monitor_ready(CliprdrClientContext* cliprdr, const CLIPRDR_MONI
 	cliprdr->ClientCapabilities(cliprdr, &caps);
 
 	pthread_mutex_lock(&session->lock);
-	if (session->pendingClipboard)
-	{
-		UINT32 format = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
-		ClipboardSetData(session->clipboard, format, session->pendingClipboard,
-		                 (UINT32)strlen(session->pendingClipboard) + 1);
-	}
+	clip_load_text(session);
 	UINT result = clip_send_format_list(session);
 	pthread_mutex_unlock(&session->lock);
-	log_line(session, "Буфер обмена подключён.");
+	log_line(session, "Буфер обмена подключён: текст и картинки в обе стороны.");
 	return result;
 }
 
@@ -455,18 +479,26 @@ static UINT clip_server_format_list(CliprdrClientContext* cliprdr, const CLIPRDR
 				session->serverFormatNames[i] = _strdup(list->formats[i].formatName);
 		}
 	}
+	/* Text first (Unicode, then 8-bit). A picture only when there is no text. */
 	UINT32 wanted = 0;
+	int haveDib = 0;
+	int haveDibV5 = 0;
 	for (UINT32 i = 0; i < session->serverFormatCount; i++)
 	{
-		if (session->serverFormatIds[i] == CF_UNICODETEXT)
-		{
+		UINT32 id = session->serverFormatIds[i];
+		if (id == CF_UNICODETEXT)
 			wanted = CF_UNICODETEXT;
-			break;
-		}
-		if (wanted == 0 && (session->serverFormatIds[i] == CF_TEXT ||
-		                    session->serverFormatIds[i] == CF_OEMTEXT))
-			wanted = session->serverFormatIds[i];
+		else if (wanted != CF_UNICODETEXT && (id == CF_TEXT || id == CF_OEMTEXT))
+			wanted = id;
+		else if (id == CF_DIB)
+			haveDib = 1;
+		else if (id == CF_DIBV5)
+			haveDibV5 = 1;
 	}
+	if (wanted == 0 && haveDib)
+		wanted = CF_DIB;
+	if (wanted == 0 && haveDibV5)
+		wanted = CF_DIBV5;
 	session->requestedFormatId = wanted;
 	pthread_mutex_unlock(&session->lock);
 
@@ -491,8 +523,22 @@ static UINT clip_format_data_request(CliprdrClientContext* cliprdr,
 {
 	RDPSession* session = (RDPSession*)cliprdr->custom;
 	UINT32 size = 0;
+	BYTE* data = nullptr;
 	pthread_mutex_lock(&session->lock);
-	BYTE* data = (BYTE*)ClipboardGetData(session->clipboard, request->requestedFormatId, &size);
+	if (request->requestedFormatId == CF_DIB)
+	{
+		if (session->pendingDib && session->pendingDibLength > 0)
+		{
+			data = (BYTE*)malloc(session->pendingDibLength);
+			if (data)
+			{
+				memcpy(data, session->pendingDib, session->pendingDibLength);
+				size = session->pendingDibLength;
+			}
+		}
+	}
+	else if (session->pendingClipboard && session->clipboard)
+		data = (BYTE*)ClipboardGetData(session->clipboard, request->requestedFormatId, &size);
 	pthread_mutex_unlock(&session->lock);
 
 	CLIPRDR_FORMAT_DATA_RESPONSE response = {};
@@ -513,6 +559,27 @@ static UINT clip_format_data_response(CliprdrClientContext* cliprdr,
 
 	pthread_mutex_lock(&session->lock);
 	UINT32 formatId = session->requestedFormatId;
+	if (formatId == CF_DIB || formatId == CF_DIBV5)
+	{
+		pthread_mutex_unlock(&session->lock);
+		UINT32 length = response->common.dataLen;
+		if (!response->requestedFormatData || length < 40)
+			return CHANNEL_RC_OK;
+		if (length > DALNY_CLIP_MAX_DIB)
+		{
+			log_line(session, "Картинка в буфере сервера больше 64 МБ, не копирую.");
+			return CHANNEL_RC_OK;
+		}
+		if (session->handlers.clipboard_image)
+			session->handlers.clipboard_image(session->handlers.ctx, response->requestedFormatData,
+			                                  length, formatId == CF_DIBV5);
+		return CHANNEL_RC_OK;
+	}
+	if (formatId == 0)
+	{
+		pthread_mutex_unlock(&session->lock);
+		return CHANNEL_RC_OK;
+	}
 	ClipboardSetData(session->clipboard, formatId, response->requestedFormatData,
 	                 response->common.dataLen);
 	UINT32 utf8Id = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
@@ -1041,6 +1108,7 @@ void rdp_session_destroy(RDPSession* session)
 		ClipboardDestroy(session->clipboard);
 	free_server_formats(session);
 	free(session->pendingClipboard);
+	free(session->pendingDib);
 	if (session->stopEvent)
 		CloseHandle(session->stopEvent);
 	if (session->resizeEvent)
@@ -1117,22 +1185,57 @@ void rdp_session_request_resize(RDPSession* session, int width, int height)
 		SetEvent(session->resizeEvent);
 }
 
-void rdp_session_set_clipboard_utf8(RDPSession* session, const char* utf8)
+void rdp_session_set_clipboard(RDPSession* session, const char* utf8, const uint8_t* dib,
+                               size_t dibLength)
 {
-	if (!session || !utf8 || !session->params.clipboard)
+	if (!session || !session->params.clipboard)
 		return;
+	if (!utf8 && (!dib || dibLength == 0))
+		return;
+	if (dibLength > DALNY_CLIP_MAX_DIB)
+	{
+		log_line(session, "Картинка больше 64 МБ, на сервер не отправляю.");
+		dib = nullptr;
+		dibLength = 0;
+		if (!utf8)
+			return;
+	}
 	pthread_mutex_lock(&session->lock);
 	free(session->pendingClipboard);
-	session->pendingClipboard = _strdup(utf8);
-	if (session->clipboard && session->pendingClipboard)
+	session->pendingClipboard = utf8 ? _strdup(utf8) : nullptr;
+	free(session->pendingDib);
+	session->pendingDib = nullptr;
+	session->pendingDibLength = 0;
+	if (dib && dibLength > 0)
 	{
-		UINT32 format = ClipboardRegisterFormat(session->clipboard, "text/plain;charset=utf-8");
-		ClipboardSetData(session->clipboard, format, session->pendingClipboard,
-		                 (UINT32)strlen(session->pendingClipboard) + 1);
+		session->pendingDib = (BYTE*)malloc(dibLength);
+		if (session->pendingDib)
+		{
+			memcpy(session->pendingDib, dib, dibLength);
+			session->pendingDibLength = (UINT32)dibLength;
+		}
+	}
+	if (session->clipboard)
+	{
+		clip_load_text(session);
 		if (session->cliprdr)
 			clip_send_format_list(session);
 	}
 	pthread_mutex_unlock(&session->lock);
+}
+
+void rdp_session_set_clipboard_utf8(RDPSession* session, const char* utf8)
+{
+	if (utf8)
+		rdp_session_set_clipboard(session, utf8, nullptr, 0);
+}
+
+void rdp_session_send_language_toggle(RDPSession* session)
+{
+	rdp_session_send_scancode(session, RDP_SCANCODE_LMENU, 1, 0);
+	rdp_session_send_scancode(session, RDP_SCANCODE_LSHIFT, 1, 0);
+	rdp_session_send_scancode(session, RDP_SCANCODE_LSHIFT, 0, 0);
+	rdp_session_send_scancode(session, RDP_SCANCODE_LMENU, 0, 0);
 }
 
 void rdp_session_remote_size(RDPSession* session, int* width, int* height)

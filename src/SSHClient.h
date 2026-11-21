@@ -22,6 +22,8 @@ NS_ASSUME_NONNULL_BEGIN
             error:(NSError* _Nullable* _Nullable)error;
 
 - (void)stop;
+/* Tunnel still running? Also forwards new ssh stderr lines to the log. NO once ssh has exited. */
+- (BOOL)checkAlive;
 
 + (BOOL)installPublicKey:(NSString*)publicKey
                     host:(NSString*)host

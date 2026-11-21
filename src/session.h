@@ -19,8 +19,8 @@ typedef struct RDPParams
 	char password[256];
 	int width;
 	int height;
-	int colorDepth;
-	int profile;
+	int colorDepth; /* 8, 16 or 32 */
+	int profile; /* 0 economy, 1 balanced, 2 quality, 3 extreme economy */
 	int clipboard;
 	char trustedFingerprint[512];
 	char pluginsDir[1024];
@@ -41,6 +41,10 @@ typedef struct RDPHandlers
 	void (*clipboard_image)(void* ctx, const uint8_t* dib, size_t length, int isV5);
 	int (*ask_certificate)(void* ctx, const char* fingerprint, int changed);
 	void (*disconnected)(void* ctx, int fatal, const char* reason);
+	/* Link quality, from the session thread. rttMs >= 0: a probe was answered after rttMs.
+	   rttMs < 0: no answer for stalledMs so far. proven: the server has answered probes in this
+	   session, so silence means the link, not an unsupported probe. */
+	void (*link)(void* ctx, int rttMs, int stalledMs, int proven);
 } RDPHandlers;
 
 RDPSession* rdp_session_create(const RDPParams* params, const RDPHandlers* handlers);

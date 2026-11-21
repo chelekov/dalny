@@ -10,6 +10,11 @@
 #import <Network/Network.h>
 #import <string.h>
 
+/* Reconnect backoff in seconds, then 30 s steps until about 5 minutes have passed. */
+static const double kReconnectBackoff[] = {1, 2, 4, 8, 15, 30};
+static const double kReconnectGiveUpSeconds = 300;
+static const int kStallDropMs = 20000;
+
 @implementation SessionWindow
 {
 	DalnyServer* _server;
@@ -46,6 +51,28 @@
 	NSLayoutConstraint* _viewToLog;
 	NSTimer* _resizeTimer;
 	NSSize _fittedRemote;
+
+	/* Lost-link overlay over the picture and the yellow poor-connection notice. */
+	NSView* _overlay;
+	NSTextField* _overlayTitle;
+	NSTextField* _overlayDetail;
+	NSButton* _overlayRetry;
+	NSView* _poorBar;
+	NSTextField* _poorText;
+	NSButton* _poorSwitch;
+	BOOL _poorDismissed;
+	CFAbsoluteTime _goodSince;
+
+	BOOL _loopRunning;
+	NSDate* _dropStarted;
+	int _lastRemoteWidth;
+	int _lastRemoteHeight;
+	volatile BOOL _stallDrop;
+	volatile BOOL _probeProven;
+	double _rttAverage;
+	volatile CFAbsoluteTime _lastAnswer;
+	volatile CFAbsoluteTime _pathCheckDeadline;
+	CFAbsoluteTime _pathCheckBaseline;
 }
 
 static void log_thunk(void* ctx, const char* line);
@@ -56,6 +83,7 @@ static void clipboard_thunk(void* ctx, const char* utf8);
 static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, int isV5);
 static int cert_thunk(void* ctx, const char* fingerprint, int changed);
 static void disconnect_thunk(void* ctx, int fatal, const char* reason);
+static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 
 - (instancetype)initWithServer:(DalnyServer*)server
 {
@@ -144,6 +172,246 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	_viewToBottom = [_view.bottomAnchor constraintEqualToAnchor:content.bottomAnchor];
 	_viewToLog = [_view.bottomAnchor constraintEqualToAnchor:_logScroll.topAnchor constant:-8];
 	_viewToBottom.active = YES;
+	[self buildOverlays];
+}
+
+- (void)buildOverlays
+{
+	NSView* content = self.window.contentView;
+
+	_overlay = [NSView new];
+	_overlay.wantsLayer = YES;
+	_overlay.layer.backgroundColor = [NSColor colorWithWhite:0 alpha:0.8].CGColor;
+	_overlay.translatesAutoresizingMaskIntoConstraints = NO;
+	_overlay.hidden = YES;
+	_overlayTitle = [NSTextField wrappingLabelWithString:@""];
+	_overlayTitle.font = [NSFont systemFontOfSize:20 weight:NSFontWeightSemibold];
+	_overlayTitle.textColor = NSColor.whiteColor;
+	_overlayTitle.alignment = NSTextAlignmentCenter;
+	_overlayDetail = [NSTextField wrappingLabelWithString:@""];
+	_overlayDetail.font = [NSFont systemFontOfSize:13];
+	_overlayDetail.textColor = [NSColor colorWithWhite:0.85 alpha:1];
+	_overlayDetail.alignment = NSTextAlignmentCenter;
+	_overlayRetry = [NSButton buttonWithTitle:@"Переподключиться сейчас" target:self action:@selector(reconnectNow:)];
+	_overlayRetry.controlSize = NSControlSizeLarge;
+	NSButton* stop = [NSButton buttonWithTitle:@"Отключиться" target:self action:@selector(disconnect:)];
+	stop.controlSize = NSControlSizeLarge;
+	NSStackView* buttons = [NSStackView stackViewWithViews:@[ _overlayRetry, stop ]];
+	buttons.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+	buttons.spacing = 12;
+	NSStackView* stack = [NSStackView stackViewWithViews:@[ _overlayTitle, _overlayDetail, buttons ]];
+	stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+	stack.alignment = NSLayoutAttributeCenterX;
+	stack.spacing = 14;
+	stack.translatesAutoresizingMaskIntoConstraints = NO;
+	[_overlay addSubview:stack];
+	[content addSubview:_overlay positioned:NSWindowAbove relativeTo:_view];
+
+	_poorBar = [NSView new];
+	_poorBar.wantsLayer = YES;
+	_poorBar.layer.backgroundColor = [NSColor colorWithRed:1.0 green:0.84 blue:0.2 alpha:0.95].CGColor;
+	_poorBar.translatesAutoresizingMaskIntoConstraints = NO;
+	_poorBar.hidden = YES;
+	_poorText = [NSTextField labelWithString:@"Плохое соединение"];
+	_poorText.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
+	_poorText.textColor = NSColor.blackColor;
+	_poorText.lineBreakMode = NSLineBreakByTruncatingTail;
+	[_poorText setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+	                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
+	_poorSwitch = [NSButton buttonWithTitle:@"Переключиться на экстремальную экономию"
+	                                 target:self
+	                                 action:@selector(toggleExtremeEconomy:)];
+	_poorSwitch.controlSize = NSControlSizeSmall;
+	_poorSwitch.refusesFirstResponder = YES;
+	NSButton* hide = [NSButton buttonWithTitle:@"Скрыть" target:self action:@selector(hidePoorNotice:)];
+	hide.controlSize = NSControlSizeSmall;
+	hide.refusesFirstResponder = YES;
+	NSStackView* bar = [NSStackView stackViewWithViews:@[ _poorText, _poorSwitch, hide ]];
+	bar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+	bar.spacing = 10;
+	bar.translatesAutoresizingMaskIntoConstraints = NO;
+	[_poorBar addSubview:bar];
+	[content addSubview:_poorBar positioned:NSWindowAbove relativeTo:_view];
+
+	[NSLayoutConstraint activateConstraints:@[
+		[_overlay.leadingAnchor constraintEqualToAnchor:_view.leadingAnchor],
+		[_overlay.trailingAnchor constraintEqualToAnchor:_view.trailingAnchor],
+		[_overlay.topAnchor constraintEqualToAnchor:_view.topAnchor],
+		[_overlay.bottomAnchor constraintEqualToAnchor:_view.bottomAnchor],
+		[stack.centerXAnchor constraintEqualToAnchor:_overlay.centerXAnchor],
+		[stack.centerYAnchor constraintEqualToAnchor:_overlay.centerYAnchor],
+		[stack.widthAnchor constraintLessThanOrEqualToAnchor:_overlay.widthAnchor constant:-40],
+		[_overlayTitle.widthAnchor constraintLessThanOrEqualToConstant:560],
+		[_overlayDetail.widthAnchor constraintLessThanOrEqualToConstant:560],
+		[_poorBar.leadingAnchor constraintEqualToAnchor:_view.leadingAnchor],
+		[_poorBar.trailingAnchor constraintEqualToAnchor:_view.trailingAnchor],
+		[_poorBar.topAnchor constraintEqualToAnchor:_view.topAnchor],
+		[bar.leadingAnchor constraintEqualToAnchor:_poorBar.leadingAnchor constant:10],
+		[bar.trailingAnchor constraintLessThanOrEqualToAnchor:_poorBar.trailingAnchor constant:-10],
+		[bar.topAnchor constraintEqualToAnchor:_poorBar.topAnchor constant:4],
+		[bar.bottomAnchor constraintEqualToAnchor:_poorBar.bottomAnchor constant:-4]
+	]];
+}
+
+// Any thread. final: the loop has stopped; the retry button starts it again and is bigger.
+- (void)showOverlayTitle:(NSString*)title detail:(NSString*)detail retry:(NSString*)retry final:(BOOL)final
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (self->_cancelled)
+			return;
+		self->_overlayTitle.stringValue = title ?: @"";
+		self->_overlayDetail.stringValue = detail ?: @"";
+		self->_overlayDetail.hidden = detail.length == 0;
+		self->_overlayRetry.title = retry ?: @"Переподключиться";
+		self->_overlayRetry.font = [NSFont systemFontOfSize:final ? 18 : 13
+		                                             weight:final ? NSFontWeightSemibold : NSFontWeightRegular];
+		self->_overlayTitle.font = [NSFont systemFontOfSize:final ? 24 : 20 weight:NSFontWeightSemibold];
+		self->_poorBar.hidden = YES;
+		self->_overlay.hidden = NO;
+	});
+}
+
+- (void)hideOverlay
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		self->_overlay.hidden = YES;
+	});
+}
+
+- (void)reconnectNow:(id)sender
+{
+	(void)sender;
+	if (_cancelled)
+		return;
+	[self appendLog:@"Переподключаюсь по кнопке."];
+	_overlayDetail.stringValue = @"Подключаюсь…";
+	if (_loopRunning)
+	{
+		_immediate = YES;
+		dispatch_semaphore_signal(_wake);
+	}
+	else
+		[self startLoop];
+}
+
+- (void)hidePoorNotice:(id)sender
+{
+	(void)sender;
+	_poorDismissed = YES;
+	_poorBar.hidden = YES;
+}
+
+// Session thread. Smoothed probe round trip; silence after proven probes means a stall.
+- (void)linkRtt:(int)rttMs stalled:(int)stalledMs proven:(int)proven
+{
+	if (proven)
+		_probeProven = YES;
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	if (rttMs >= 0)
+	{
+		_lastAnswer = now;
+		_rttAverage = _rttAverage > 0 ? _rttAverage * 0.7 + rttMs * 0.3 : rttMs;
+		if (_rttAverage > 800)
+			[self showPoorNotice:[NSString stringWithFormat:@"Плохое соединение: ответ сервера %.1f с.", _rttAverage / 1000.0]];
+		else if (_rttAverage < 500)
+		{
+			if (_goodSince == 0)
+				_goodSince = now;
+			if (now - _goodSince >= 10)
+				dispatch_async(dispatch_get_main_queue(), ^{
+					self->_poorBar.hidden = YES;
+				});
+		}
+		return;
+	}
+	if (!_probeProven || stalledMs < 3000)
+		return;
+	[self showPoorNotice:[NSString stringWithFormat:@"Плохое соединение: сервер не отвечает %d с.", stalledMs / 1000]];
+	if (stalledMs >= kStallDropMs)
+		_stallDrop = YES;
+}
+
+- (void)showPoorNotice:(NSString*)text
+{
+	_goodSince = 0;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (self->_poorDismissed || !self->_overlay.hidden || self->_cancelled)
+			return;
+		if (self->_poorBar.hidden)
+			[self appendLog:text];
+		self->_poorText.stringValue = text;
+		self->_poorText.toolTip = @"Связь медленная или прерывается. Экстремальная экономия (640x480, 256 цветов) передаёт намного меньше данных.";
+		self->_poorSwitch.hidden = self->_server.isExtremeEconomy;
+		self->_poorBar.hidden = NO;
+	});
+}
+
+// Switch to or back from the extreme-economy profile and reconnect. The color depth changes,
+// so xrdp opens (or returns) a different session: say so before doing it.
+- (void)toggleExtremeEconomy:(id)sender
+{
+	(void)sender;
+	if (_cancelled || self.window.attachedSheet)
+		return;
+	BOOL toExtreme = !_server.isExtremeEconomy;
+	NSAlert* alert = [NSAlert new];
+	if (toExtreme)
+	{
+		alert.messageText = @"Переключиться на экстремальную экономию?";
+		alert.informativeText = [NSString stringWithFormat:@"%@\n\nСейчас переподключусь. Несохранённая работа в прежнем сеансе не пропадёт: он останется на сервере.",
+		                                                   [DalnyServer profileHint:@"extreme"]];
+	}
+	else
+	{
+		alert.messageText = @"Вернуть прежний профиль картинки?";
+		alert.informativeText = @"Переподключусь с прежними размером и глубиной цвета. Сервер вернёт сеанс, который был открыт с ними; сеанс в 256 цветах останется на сервере отдельно.";
+	}
+	[alert addButtonWithTitle:@"Переключить и переподключиться"];
+	[alert addButtonWithTitle:@"Отмена"];
+	__weak typeof(self) weakSelf = self;
+	[alert beginSheetModalForWindow:self.window
+	              completionHandler:^(NSModalResponse response) {
+		              typeof(self) strongSelf = weakSelf;
+		              if (strongSelf && response == NSAlertFirstButtonReturn)
+			              [strongSelf applyExtremeEconomy:toExtreme];
+	              }];
+}
+
+- (void)applyExtremeEconomy:(BOOL)toExtreme
+{
+	if (toExtreme)
+		[_server switchToExtremeEconomy];
+	else if (![_server restoreProfileBeforeExtreme])
+	{
+		_server.graphics = @"economy";
+		[_server applyGraphicsProfile];
+	}
+	[[ServerStore sharedStore] save];
+	[self appendLog:toExtreme ? @"Профиль: экстремальная экономия (640x480, 8 бит). Переподключаюсь."
+	                          : [NSString stringWithFormat:@"Профиль: «%@», %ld бит. Переподключаюсь.", _server.graphics,
+	                                                       (long)_server.colorDepth]];
+	/* A new depth means a new session size: do not reuse the old remote size. */
+	_lastRemoteWidth = 0;
+	_lastRemoteHeight = 0;
+	_poorBar.hidden = YES;
+	_poorDismissed = NO;
+	_view.fitDisplay = ![self isFixedMode];
+	if ([self isFixedMode])
+	{
+		_fittedRemote = NSZeroSize;
+		[_view noteRemoteSizeWidth:(int)_server.width height:(int)_server.height];
+		[self fitWindowToRemote];
+	}
+	else
+	{
+		self.window.contentMaxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+		self.window.contentMinSize = NSMakeSize(640, 420);
+	}
+	[self showOverlayTitle:@"Меняю профиль картинки — переподключаюсь…" detail:nil retry:@"Переподключиться сейчас" final:NO];
+	if (_loopRunning)
+		[self abortWork];
+	else
+		[self startLoop];
 }
 
 - (BOOL)isFixedMode
@@ -294,6 +562,10 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 {
 	if (item.action == @selector(switchLanguage:))
 		return _rdp != NULL && _view.session != NULL;
+	if (item.action == @selector(toggleExtremeEconomy:))
+		item.state = _server.isExtremeEconomy ? NSControlStateValueOn : NSControlStateValueOff;
+	if (item.action == @selector(reconnectNow:))
+		return !_cancelled;
 	return YES;
 }
 
@@ -371,6 +643,16 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		}
 		if (changed)
 		{
+			if (self->_rdp && self->_sawFrame && self->_probeProven && !self->_stallDrop)
+			{
+				/* The session answers link probes: give it a few seconds to prove it survived
+				 * (split-tunnel VPNs often keep it). Otherwise the run loop reconnects. */
+				self->_pathCheckBaseline = self->_lastAnswer;
+				self->_pathCheckDeadline = CFAbsoluteTimeGetCurrent() + 6;
+				[self setStatus:@"Сеть изменилась (VPN или другой интерфейс). Проверяю связь…"];
+				[self appendLog:@"Сетевой маршрут изменился, проверяю, отвечает ли сеанс."];
+				return;
+			}
 			[self setStatus:@"Сеть изменилась (VPN или другой интерфейс). Переподключаюсь…"];
 			[self appendLog:@"Сетевой маршрут изменился, начинаю чистое переподключение."];
 			[self abortWork];
@@ -527,41 +809,97 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	return saved;
 }
 
+// Waits up to `seconds`. Returns early on cancel, a manual or network retry, or when the
+// network goes away (online) / comes back (offline).
 - (void)sleepSeconds:(double)seconds generation:(NSInteger)generation
 {
 	NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+	BOOL offline = !_networkUp;
 	while (!_cancelled && !_immediate && _generation == generation && [deadline timeIntervalSinceNow] > 0)
 	{
-		if (!_networkUp)
+		if (_networkUp == offline)
 			return;
 		dispatch_semaphore_wait(_wake, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)));
 	}
+}
+
+
+- (double)backoffForAttempt:(int)attempt
+{
+	int index = attempt - 1;
+	int last = (int)(sizeof(kReconnectBackoff) / sizeof(kReconnectBackoff[0])) - 1;
+	if (index < 0)
+		index = 0;
+	if (index > last)
+		index = last;
+	return kReconnectBackoff[index];
+}
+
+- (void)startLoop
+{
+	if (_loopRunning || _cancelled)
+		return;
+	_loopRunning = YES;
+	dispatch_async(_queue, ^{
+		[self runLoop];
+	});
 }
 
 - (void)runLoop
 {
 	int attempt = 0;
 	NSString* lastReason = @"";
+	NSString* stopMessage = nil;
+	_giveUp = NO;
+	_credentialsRejected = NO;
+	_immediate = NO;
+	_dropStarted = nil;
 	while (!_cancelled)
 	{
 		if (!_networkUp)
 		{
 			[self setStatus:@"Нет сети. Жду, пока появится маршрут…"];
+			[self showOverlayTitle:@"Связь потеряна — нет сети"
+			                detail:@"Жду, пока появится сеть (Wi‑Fi, кабель или VPN). Переподключусь сразу, как только она появится."
+			                 retry:@"Переподключиться сейчас"
+			                 final:NO];
+			/* Time without any network does not count towards giving up. */
+			_dropStarted = nil;
 			[self sleepSeconds:3600 generation:_generation];
 			continue;
 		}
-		if (attempt > 0 && !_immediate && _server.autoReconnect)
+		if (attempt > 0)
 		{
-			double delay = MIN(30.0, pow(2.0, MIN(attempt, 5))) + (arc4random_uniform(500) / 1000.0);
-			[self setStatus:[NSString stringWithFormat:@"Переподключение через %.0f с, попытка %d. %@", delay, attempt,
-			                                            lastReason ?: @""]];
-			[self sleepSeconds:delay generation:_generation];
-			if (_cancelled)
-				break;
-			if (!_networkUp)
-				continue;
+			if (!_dropStarted)
+				_dropStarted = [NSDate date];
+			if (!_immediate)
+			{
+				if (-[_dropStarted timeIntervalSinceNow] > kReconnectGiveUpSeconds)
+				{
+					stopMessage = [NSString stringWithFormat:@"Не удалось переподключиться за 5 минут. %@", lastReason ?: @""];
+					break;
+				}
+				double delay = [self backoffForAttempt:attempt];
+				[self setStatus:[NSString stringWithFormat:@"Связь потеряна — переподключаюсь… (попытка %d, через %.0f с). %@",
+				                                           attempt, delay, lastReason ?: @""]];
+				[self showOverlayTitle:[NSString stringWithFormat:@"Связь потеряна — переподключаюсь… (попытка %d)", attempt]
+				                detail:[NSString stringWithFormat:@"Следующая попытка через %.0f с. %@", delay, lastReason ?: @""]
+				                 retry:@"Переподключиться сейчас"
+				                 final:NO];
+				[self sleepSeconds:delay generation:_generation];
+				if (_cancelled)
+					break;
+				if (!_networkUp)
+					continue;
+			}
+			[self showOverlayTitle:[NSString stringWithFormat:@"Связь потеряна — переподключаюсь… (попытка %d)", attempt]
+			                detail:@"Подключаюсь заново к тому же сеансу на сервере…"
+			                 retry:@"Переподключиться сейчас"
+			                 final:NO];
 		}
 		_immediate = NO;
+		_stallDrop = NO;
+		_pathCheckDeadline = 0;
 		NSInteger generation = _generation;
 
 		NSError* passwordError = nil;
@@ -580,10 +918,8 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		}
 		if (missing.count > 0)
 		{
-			NSString* message = [NSString stringWithFormat:@"Подключение остановлено: не заполнено — %@.",
-			                                               [missing componentsJoinedByString:@"; "]];
-			[self setStatus:message];
-			[self appendLog:message];
+			stopMessage = [NSString stringWithFormat:@"Подключение остановлено: не заполнено — %@.",
+			                                         [missing componentsJoinedByString:@"; "]];
 			break;
 		}
 
@@ -603,18 +939,17 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 			if (key.length == 0 && sshPassword.length == 0)
 			{
 				NSString* field = sshPasswordAuth ? @"пароль SSH" : @"секретный ключ SSH";
-				NSString* message = sshSecretError.localizedDescription.length > 0
+				stopMessage = sshSecretError.localizedDescription.length > 0
 				    ? [NSString stringWithFormat:@"Подключение остановлено: нет поля «%@». %@", field,
 				                                 sshSecretError.localizedDescription]
 				    : [NSString stringWithFormat:@"Подключение остановлено: не заполнено — %@.", field];
-				[self setStatus:message];
-				[self appendLog:message];
 				break;
 			}
 			NSString* sshHost = _server.effectiveSSHHost;
 			NSString* sshUser = _server.sshUsername.length ? _server.sshUsername : _server.username;
 			NSError* error = nil;
 			__weak typeof(self) weakSelf = self;
+			/* A new local port every time (startHost reserves a fresh one). */
 			BOOL up = [_tunnel startHost:sshHost
 			                        port:(int)_server.sshPort
 			                    username:sshUser
@@ -626,13 +961,15 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 			                     }
 			                         log:^(NSString* line) {
 				                         [weakSelf appendLog:line];
-			                     }
+			                         }
 			                       error:&error];
 			if (!up)
 			{
 				lastReason = error.localizedDescription ?: @"Туннель не открылся.";
 				[self appendLog:lastReason];
-				if (error.code == 4 && !_cancelled)
+				if (_cancelled)
+					break;
+				if (error.code == 4)
 				{
 					if (sshPasswordAuth && [self askCredentialsForSSH:YES])
 					{
@@ -640,24 +977,30 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 						_immediate = YES;
 						continue;
 					}
-					NSString* message = sshPasswordAuth
+					stopMessage = sshPasswordAuth
 					    ? [NSString stringWithFormat:@"Сервер SSH «%@» не принял логин или пароль.", _server.displayTitle]
 					    : [NSString stringWithFormat:@"Сервер SSH «%@» не принял ключ. Проверьте пользователя и ключ в настройках сервера.",
 					                                 _server.displayTitle];
-					[self appendLog:message];
-					[self setStatus:message];
 					break;
 				}
-				if (error.code == 1 || error.code == 2 || !_server.autoReconnect)
+				if (error.code == 1 || error.code == 2)
 				{
-					[self setStatus:[NSString stringWithFormat:@"Не удалось: %@", lastReason]];
+					stopMessage = [NSString stringWithFormat:@"Не удалось: %@", lastReason];
 					break;
 				}
-				attempt += 1;
+				if (!_server.autoReconnect && generation == _generation)
+				{
+					stopMessage = [NSString stringWithFormat:@"Не удалось: %@ Само переподключение выключено в настройках сервера.", lastReason];
+					break;
+				}
+				attempt = MAX(attempt + (generation == _generation ? 1 : 0), 1);
 				continue;
 			}
 			if (_cancelled || generation != _generation)
+			{
+				attempt = MAX(attempt, 1);
 				continue;
+			}
 			targetHost = @"127.0.0.1";
 			targetPort = _tunnel.localPort;
 			[self setStatus:@"Туннель готов. Вхожу на рабочий стол…"];
@@ -675,26 +1018,37 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		snprintf(params.password, sizeof(params.password), "%s", password.UTF8String);
 		__block int liveWidth = (int)_server.width;
 		__block int liveHeight = (int)_server.height;
-		if ([_server.displayMode isEqualToString:@"fullscreen"] || [_server.displayMode isEqualToString:@"fit"])
+		if (![self isFixedMode])
 		{
-			dispatch_sync(dispatch_get_main_queue(), ^{
-				NSSize size = self->_view.bounds.size;
-				CGFloat scale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1;
-				if ([self->_server.displayMode isEqualToString:@"fullscreen"])
-					size = self.window.screen ? self.window.screen.frame.size : size;
-				liveWidth = MAX(640, (int)(size.width * scale));
-				liveHeight = MAX(480, (int)(size.height * scale));
-			});
+			if (_lastRemoteWidth >= 200 && _lastRemoteHeight >= 200)
+			{
+				/* Reconnect: same size as the session we lost, so xrdp hands back the same desktop. */
+				liveWidth = _lastRemoteWidth;
+				liveHeight = _lastRemoteHeight;
+			}
+			else
+			{
+				dispatch_sync(dispatch_get_main_queue(), ^{
+					NSSize size = self->_view.bounds.size;
+					CGFloat scale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1;
+					if ([self->_server.displayMode isEqualToString:@"fullscreen"])
+						size = self.window.screen ? self.window.screen.frame.size : size;
+					liveWidth = MAX(640, (int)(size.width * scale));
+					liveHeight = MAX(480, (int)(size.height * scale));
+				});
+			}
 		}
 		params.width = liveWidth;
 		params.height = liveHeight;
 		params.colorDepth = (int)_server.colorDepth;
-		params.profile = [_server.graphics isEqualToString:@"quality"] ? 2 : ([_server.graphics isEqualToString:@"balanced"] ? 1 : 0);
+		params.profile = [DalnyServer profileIndex:_server.graphics];
 		params.clipboard = _server.shareClipboard;
 		snprintf(params.trustedFingerprint, sizeof(params.trustedFingerprint), "%s",
 		         _server.certFingerprint.UTF8String ?: "");
 		NSString* plugins = [[NSBundle mainBundle] privateFrameworksPath];
 		snprintf(params.pluginsDir, sizeof(params.pluginsDir), "%s", plugins.UTF8String ?: "");
+		[self appendLog:[NSString stringWithFormat:@"Рабочий стол %dx%d, %d бит, профиль «%@».", liveWidth, liveHeight,
+		                                           params.colorDepth, _server.graphics ?: @"economy"]];
 
 		RDPHandlers handlers = {0};
 		handlers.ctx = (__bridge void*)self;
@@ -705,16 +1059,19 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		handlers.clipboard_image = clipboard_image_thunk;
 		handlers.ask_certificate = cert_thunk;
 		handlers.disconnected = disconnect_thunk;
+		handlers.link = link_thunk;
 
 		_rdp = rdp_session_create(&params, &handlers);
 		memset(params.password, 0, sizeof(params.password));
 		if (!_rdp)
 		{
-			lastReason = @"Не удалось подготовить FreeRDP.";
-			[self setStatus:lastReason];
+			stopMessage = @"Не удалось подготовить FreeRDP.";
 			break;
 		}
 		self->_sawFrame = NO;
+		self->_probeProven = NO;
+		self->_rttAverage = 0;
+		self->_lastAnswer = 0;
 		dispatch_async(dispatch_get_main_queue(), ^{
 			/* Offer what is on the Mac clipboard now to the new session. */
 			self->_pasteboardBaseline = -1;
@@ -727,10 +1084,40 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		});
 		self->_rdpFinished = NO;
 		rdp_session_start(_rdp);
+		NSString* dropReason = nil;
+		int tick = 0;
 		while (!self->_rdpFinished)
 		{
 			if (self->_cancelled || generation != self->_generation)
 				rdp_session_stop(self->_rdp);
+			else if (!dropReason && ++tick % 5 == 0)
+			{
+				/* Twice a second: tunnel process, link stall, path-change check. */
+				if (_server.sshEnabled && ![_tunnel checkAlive])
+					dropReason = @"SSH-туннель оборвался (процесс ssh завершился).";
+				else if (_stallDrop)
+					dropReason = [NSString stringWithFormat:@"Сервер не отвечает %d с.", kStallDropMs / 1000];
+				else if (_pathCheckDeadline > 0)
+				{
+					if (_lastAnswer > _pathCheckBaseline)
+					{
+						_pathCheckDeadline = 0;
+						[self appendLog:@"Сеть изменилась, но сеанс отвечает — переподключение не нужно."];
+						[self setStatus:@"Подключено."];
+					}
+					else if (CFAbsoluteTimeGetCurrent() > _pathCheckDeadline)
+					{
+						_pathCheckDeadline = 0;
+						dropReason = @"После смены сети сервер не отвечает.";
+						_immediate = YES;
+					}
+				}
+				if (dropReason)
+				{
+					[self appendLog:dropReason];
+					rdp_session_stop(self->_rdp);
+				}
+			}
 			usleep(100000);
 		}
 		RDPSession* finished = _rdp;
@@ -740,12 +1127,27 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		dispatch_sync(dispatch_get_main_queue(), ^{
 			[self->_view releaseAllKeys];
 			self->_view.session = nil;
+			self->_poorBar.hidden = YES;
 		});
 		rdp_session_destroy(finished);
 		[_tunnel stop];
 		if (_cancelled)
 			break;
-		if (_giveUp && _credentialsRejected && !_cancelled)
+		BOOL hadFrame = _sawFrame;
+		if (hadFrame)
+		{
+			attempt = 0;
+			_dropStarted = nil;
+			_lastRemoteWidth = _remoteWidth;
+			_lastRemoteHeight = _remoteHeight;
+		}
+		/* A stop the app asked for (network change, dead tunnel, stall) is never fatal. */
+		if (dropReason || generation != _generation)
+		{
+			_giveUp = NO;
+			_credentialsRejected = NO;
+		}
+		if (_giveUp && _credentialsRejected)
 		{
 			_giveUp = NO;
 			_credentialsRejected = NO;
@@ -755,29 +1157,45 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 				_immediate = YES;
 				continue;
 			}
-			[self setStatus:[NSString stringWithFormat:@"Неверный логин или пароль для сервера «%@». Подключение остановлено.",
-			                                           _server.displayTitle]];
+			stopMessage = [NSString stringWithFormat:@"Неверный логин или пароль для сервера «%@». Подключение остановлено.",
+			                                         _server.displayTitle];
 			break;
 		}
 		if (_giveUp)
+		{
+			_giveUp = NO;
+			stopMessage = [NSString stringWithFormat:@"Подключение остановлено: %@", _lastReason ?: @"ошибка настройки."];
 			break;
+		}
+		lastReason = dropReason ?: (_lastReason ?: lastReason);
 		if (_immediate || generation != _generation)
 		{
-			attempt = MAX(attempt, 1);
+			attempt = MAX(attempt + 1, 1);
 			continue;
 		}
 		if (!_server.autoReconnect)
 		{
-			[self setStatus:[NSString stringWithFormat:@"Отключено. %@", _lastReason ?: @""]];
+			stopMessage = [NSString stringWithFormat:@"Связь потеряна. %@ Само переподключение выключено в настройках сервера.",
+			                                         lastReason ?: @""];
 			break;
 		}
-		lastReason = _lastReason ?: lastReason;
 		attempt += 1;
 	}
 	if (_cancelled)
+	{
 		[self setStatus:@"Отключено."];
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->_loopRunning = NO;
+		});
+		return;
+	}
+	/* The window stays open with a big reconnect button. It only closes when the user closes it. */
+	NSString* message = stopMessage ?: @"Подключение остановлено.";
+	[self appendLog:message];
+	[self setStatus:message];
+	[self showOverlayTitle:@"Нет подключения" detail:message retry:@"Переподключиться" final:YES];
 	dispatch_async(dispatch_get_main_queue(), ^{
-		[[NSNotificationCenter defaultCenter] postNotificationName:@"DalnySessionFinished" object:self];
+		self->_loopRunning = NO;
 	});
 }
 
@@ -796,6 +1214,28 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	if (!_sawFrame)
 	{
 		_sawFrame = YES;
+		BOOL reconnected = _lastRemoteWidth > 0 || _dropStarted != nil;
+		dispatch_async(dispatch_get_main_queue(), ^{
+			BOOL wasLost = !self->_overlay.hidden;
+			self->_overlay.hidden = YES;
+			self->_poorDismissed = NO;
+			self->_status.stringValue = @"Подключено.";
+			if (wasLost || reconnected)
+			{
+				[self appendLog:@"Связь восстановлена."];
+				/* Same session at the old size; now match the window again if it changed. */
+				if (![self isFixedMode])
+					dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+					               dispatch_get_main_queue(), ^{
+						               NSSize size = self->_view.bounds.size;
+						               CGFloat scale = self.window.backingScaleFactor ?: 1;
+						               int width = MAX(640, (int)(size.width * scale)) & ~1;
+						               int height = MAX(480, (int)(size.height * scale)) & ~1;
+						               if (abs(width - self->_remoteWidth) > 2 || abs(height - self->_remoteHeight) > 2)
+							               [self requestFitSize];
+					               });
+			}
+		});
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			if (self->_rdp && !self.window.attachedSheet)
 				[self maybeOfferLanguageSetup];
@@ -868,9 +1308,7 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	{
 		_started = YES;
 		dispatch_async(dispatch_get_main_queue(), ^{
-			dispatch_async(self->_queue, ^{
-				[self runLoop];
-			});
+			[self startLoop];
 		});
 	}
 	[_pasteboardTimer invalidate];
@@ -1008,6 +1446,10 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	[_pasteboardTimer invalidate];
 	[_resizeTimer invalidate];
 	_resizeTimer = nil;
+	/* Only closing the window ends a session window. Network loss never does. */
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[[NSNotificationCenter defaultCenter] postNotificationName:@"DalnySessionFinished" object:self];
+	});
 }
 
 @end
@@ -1051,6 +1493,11 @@ static void clipboard_image_thunk(void* ctx, const uint8_t* dib, size_t length, 
 static int cert_thunk(void* ctx, const char* fingerprint, int changed)
 {
 	return [window_from(ctx) askCertificate:fingerprint ? @(fingerprint) : @"" changed:changed];
+}
+
+static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven)
+{
+	[window_from(ctx) linkRtt:rttMs stalled:stalledMs proven:proven];
 }
 
 static void disconnect_thunk(void* ctx, int fatal, const char* reason)

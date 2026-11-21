@@ -1,5 +1,6 @@
 #import "SSHClient.h"
 #import <arpa/inet.h>
+#import <errno.h>
 #import <fcntl.h>
 #import <netinet/in.h>
 #import <signal.h>
@@ -54,6 +55,10 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	NSString* _keyPath;
 	NSMutableString* _stderrText;
 	BOOL _captureStdout;
+	/* Tunnel stderr stays open after the tunnel is up: ssh must not hit a closed pipe, and its
+	 * "Timeout, server not responding" lines go to the log. */
+	int _tunnelStderr;
+	void (^_tunnelLog)(NSString*);
 }
 
 + (NSURL*)supportFolder
@@ -398,8 +403,44 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	}
 }
 
+- (BOOL)checkAlive
+{
+	@synchronized(self)
+	{
+		if (_tunnelStderr > 0)
+			[self consumeStderr:_tunnelStderr log:_tunnelLog];
+		if (_pid <= 0)
+			return NO;
+		int status = 0;
+		pid_t result = waitpid(_pid, &status, WNOHANG);
+		if (result == _pid || (result < 0 && errno == ECHILD))
+		{
+			if (_tunnelStderr > 0)
+				[self consumeStderr:_tunnelStderr log:_tunnelLog];
+			_pid = 0;
+			_running = NO;
+			return NO;
+		}
+		return YES;
+	}
+}
+
 - (void)stop
 {
+	@synchronized(self)
+	{
+		[self stopLocked];
+	}
+}
+
+- (void)stopLocked
+{
+	if (_tunnelStderr > 0)
+	{
+		close(_tunnelStderr);
+		_tunnelStderr = 0;
+	}
+	_tunnelLog = nil;
 	if (_pid > 0)
 	{
 		kill(-_pid, SIGTERM);
@@ -684,7 +725,15 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	if (![self launchSSHWithArguments:args password:keyPEM.length ? nil : password stderrOut:&stderrFd error:error])
 		return NO;
 	BOOL opened = [self waitForLocalPort:local stderrFd:stderrFd log:log];
-	if (stderrFd >= 0)
+	if (opened && stderrFd > 0)
+	{
+		@synchronized(self)
+		{
+			_tunnelStderr = stderrFd;
+			_tunnelLog = [log copy];
+		}
+	}
+	else if (stderrFd >= 0)
 		close(stderrFd);
 	if (!opened)
 	{

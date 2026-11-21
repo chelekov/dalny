@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <time.h>
 
 static void wipe_bytes(void* buffer, size_t length)
 {
@@ -68,7 +69,22 @@ struct RDPSession
 
 	DispClientContext* disp;
 	int resizeNoteLogged;
+
+	/* Link probe: when the server has been quiet for a while, ask it to repaint a tiny area
+	 * (Refresh Rect PDU) and time the answer. Any update counts as an answer. */
+	volatile uint64_t lastActivityMs;
+	volatile uint64_t probeSentMs;
+	uint64_t lastProbeMs;
+	uint64_t lastLinkReportMs;
+	volatile int probesAnswered;
 };
+
+static uint64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
 
 typedef struct
 {
@@ -306,9 +322,26 @@ static BOOL begin_paint(rdpContext* context)
 	return TRUE;
 }
 
+static void note_activity(RDPSession* session)
+{
+	if (!session)
+		return;
+	uint64_t now = now_ms();
+	uint64_t sent = session->probeSentMs;
+	session->lastActivityMs = now;
+	if (sent)
+	{
+		session->probeSentMs = 0;
+		session->probesAnswered += 1;
+		if (session->handlers.link)
+			session->handlers.link(session->handlers.ctx, (int)(now - sent), 0, 1);
+	}
+}
+
 static BOOL end_paint(rdpContext* context)
 {
 	RDPSession* session = session_from(context);
+	note_activity(session);
 	rdpGdi* gdi = context ? context->gdi : nullptr;
 	if (!session || !gdi || !gdi->primary || !gdi->primary->hdc || !gdi->primary->hdc->hwnd)
 		return TRUE;
@@ -689,9 +722,11 @@ static void on_channel_disconnected(void* context, const ChannelDisconnectedEven
 static void apply_graphics(rdpSettings* settings, const RDPParams* params)
 {
 	int profile = params->profile;
-	if (profile < 0 || profile > 2)
+	if (profile < 0 || profile > 3)
 		profile = 0;
-	int depth = params->colorDepth == 16 ? 16 : 32;
+	/* 3: extreme economy. 8 bpp (256 colors) is the smallest depth RDP offers to xrdp. */
+	int extreme = profile == 3;
+	int depth = params->colorDepth == 8 ? 8 : (params->colorDepth == 16 ? 16 : 32);
 	UINT32 width = (UINT32)(params->width < 200 ? 200 : params->width);
 	UINT32 height = (UINT32)(params->height < 200 ? 200 : params->height);
 	width &= ~1u;
@@ -701,16 +736,17 @@ static void apply_graphics(rdpSettings* settings, const RDPParams* params)
 	freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height);
 	freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, (UINT32)depth);
 
-	freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, profile == 0);
+	freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, extreme ? FALSE : TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NSCodec, extreme ? FALSE : TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_NSCodecAllowSubsampling, profile == 0 || extreme);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_JpegCodec, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
-	freerdp_settings_set_uint32(settings, FreeRDP_ConnectionType, CONNECTION_TYPE_LAN);
+	freerdp_settings_set_uint32(settings, FreeRDP_ConnectionType,
+	                            extreme ? CONNECTION_TYPE_MODEM : CONNECTION_TYPE_LAN);
 	freerdp_settings_set_bool(settings, FreeRDP_CompressionEnabled, TRUE);
 	freerdp_settings_set_uint32(settings, FreeRDP_CompressionLevel, PACKET_COMPR_TYPE_RDP61);
 	freerdp_settings_set_bool(settings, FreeRDP_BitmapCacheEnabled, TRUE);
@@ -719,8 +755,12 @@ static void apply_graphics(rdpSettings* settings, const RDPParams* params)
 	freerdp_settings_set_bool(settings, FreeRDP_DisableWallpaper, profile != 2);
 	freerdp_settings_set_bool(settings, FreeRDP_DisableFullWindowDrag, TRUE);
 	freerdp_settings_set_bool(settings, FreeRDP_DisableMenuAnims, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_DisableThemes, profile == 0);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableThemes, profile == 0 || extreme);
 	freerdp_settings_set_bool(settings, FreeRDP_AllowFontSmoothing, profile == 2);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableCursorShadow, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_DisableCursorBlinking, extreme ? TRUE : FALSE);
+	/* RDP has no frame-rate cap outside GFX (which xrdp 0.9 does not offer); extreme economy
+	 * relies on 8 bpp, the bitmap cache and compression instead. */
 	freerdp_settings_set_bool(settings, FreeRDP_AllowDesktopComposition, FALSE);
 
 	freerdp_settings_set_uint32(settings, FreeRDP_KeyboardLayout, 0x00000409);
@@ -953,6 +993,43 @@ static int error_is_auth(UINT32 code)
 	return 0;
 }
 
+/* Runs on the session thread between event waits. */
+static void probe_link(RDPSession* session)
+{
+	rdpContext* context = session->context;
+	if (!context || !context->update || !context->update->RefreshRect)
+		return;
+	uint64_t now = now_ms();
+	uint64_t sent = session->probeSentMs;
+	if (sent)
+	{
+		uint64_t waited = now - sent;
+		if (waited >= 3000 && now - session->lastLinkReportMs >= 1000)
+		{
+			session->lastLinkReportMs = now;
+			if (session->handlers.link)
+				session->handlers.link(session->handlers.ctx, -1, (int)waited, session->probesAnswered > 0);
+		}
+		return;
+	}
+	if (now - session->lastActivityMs < 2000 || now - session->lastProbeMs < 2000)
+		return;
+	if (!freerdp_settings_get_bool(context->settings, FreeRDP_RefreshRect))
+		return;
+	UINT32 width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+	UINT32 height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+	if (width < 16 || height < 16)
+		return;
+	RECTANGLE_16 area;
+	area.left = 0;
+	area.top = 0;
+	area.right = 15;
+	area.bottom = 15;
+	session->lastProbeMs = now;
+	if (context->update->RefreshRect(context, 1, &area))
+		session->probeSentMs = now;
+}
+
 static void* session_thread(void* argument)
 {
 	RDPSession* session = (RDPSession*)argument;
@@ -970,14 +1047,22 @@ static void* session_thread(void* argument)
 		}
 		if (!session->certRejected && (session->authFailed || error_is_credentials(code)))
 			fatal = RDP_FATAL_CREDENTIALS;
+		/* Stopped by the app (network change, tunnel restart): never a reason to give up. */
+		if (session->stop)
+			fatal = 0;
 		if (session->handlers.disconnected)
 			session->handlers.disconnected(session->handlers.ctx, fatal, text ? text : "Нет соединения");
 		return nullptr;
 	}
 
+	session->lastActivityMs = now_ms();
+	session->probeSentMs = 0;
+	session->lastProbeMs = 0;
+	session->probesAnswered = 0;
 	HANDLE handles[32];
 	while (!session->stop && !freerdp_shall_disconnect_context(session->context))
 	{
+		probe_link(session);
 		DWORD count = 0;
 		handles[count++] = session->stopEvent;
 		HANDLE inputEvent =
@@ -1017,6 +1102,8 @@ static void* session_thread(void* argument)
 	int fatal = session->certRejected || session->authFailed || error_is_config(code);
 	if (!session->certRejected && (session->authFailed || error_is_credentials(code)))
 		fatal = RDP_FATAL_CREDENTIALS;
+	if (session->stop)
+		fatal = 0;
 	if (session->handlers.disconnected)
 		session->handlers.disconnected(session->handlers.ctx, fatal, reason);
 	return nullptr;

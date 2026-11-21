@@ -13,6 +13,7 @@
 	NSTextField* _username;
 	NSSecureTextField* _password;
 	NSPopUpButton* _graphics;
+	NSTextField* _profileHint;
 	NSPopUpButton* _display;
 	NSTextField* _width;
 	NSTextField* _height;
@@ -100,13 +101,17 @@
 	_username = [self input];
 	_password = [self secret];
 	_graphics = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 220, 24) pullsDown:NO];
-	[_graphics addItemsWithTitles:@[ @"Эконом", @"Сбалансированный", @"Качество" ]];
+	[_graphics addItemsWithTitles:@[ @"Эконом", @"Сбалансированный", @"Качество", @"Экстремальная экономия" ]];
 	_graphics.target = self;
 	_graphics.action = @selector(profileChanged:);
 	_display = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 220, 24) pullsDown:NO];
 	[_display addItemsWithTitles:@[ @"По размеру окна", @"Фиксированное", @"На весь экран" ]];
 	_width = [self input];
 	_height = [self input];
+	_profileHint = [self label:@""];
+	_profileHint.textColor = NSColor.secondaryLabelColor;
+	_profileHint.maximumNumberOfLines = 6;
+	_profileHint.preferredMaxLayoutWidth = 460;
 	_bppWarning = [self label:@""];
 	_bppWarning.textColor = [NSColor systemOrangeColor];
 	_bppWarning.maximumNumberOfLines = 3;
@@ -187,6 +192,7 @@
 		[self row:@"Пользователь" control:_username],
 		[self row:@"Пароль" control:_password],
 		[self row:@"Картинка" control:_graphics],
+		_profileHint,
 		_advancedToggle,
 		_advanced,
 		buttons
@@ -221,6 +227,8 @@
 		return @"balanced";
 	case 2:
 		return @"quality";
+	case 3:
+		return @"extreme";
 	default:
 		return @"economy";
 	}
@@ -236,12 +244,7 @@
 	_password.stringValue = [Keychain secretForAccount:_server.rdpPasswordAccount error:&passwordError] ?: @"";
 	if (passwordError)
 		[DalnyLog append:passwordError.localizedDescription];
-	if ([_server.graphics isEqualToString:@"balanced"])
-		[_graphics selectItemAtIndex:1];
-	else if ([_server.graphics isEqualToString:@"quality"])
-		[_graphics selectItemAtIndex:2];
-	else
-		[_graphics selectItemAtIndex:0];
+	[_graphics selectItemAtIndex:[DalnyServer profileIndex:_server.graphics]];
 	if ([_server.displayMode isEqualToString:@"fixed"])
 		[_display selectItemAtIndex:1];
 	else if ([_server.displayMode isEqualToString:@"fullscreen"])
@@ -284,12 +287,20 @@
 	_password.placeholderString = separate ? @"только рабочий стол" : @"рабочий стол и SSH";
 }
 
+- (NSInteger)depthForProfile:(NSString*)profile
+{
+	if ([profile isEqualToString:@"extreme"])
+		return 8;
+	return [profile isEqualToString:@"economy"] ? 16 : 32;
+}
+
 - (void)refreshBppWarning
 {
-	NSInteger depth = [[self profileKey] isEqualToString:@"economy"] ? 16 : 32;
+	_profileHint.stringValue = [DalnyServer profileHint:[self profileKey]];
+	NSInteger depth = [self depthForProfile:[self profileKey]];
 	if (_openedDepth != 0 && depth != _openedDepth)
 	{
-		_bppWarning.stringValue = @"Смена глубины цвета откроет другой рабочий стол на сервере, а не вернёт текущий. Сервер запоминает сеанс отдельно для 16 и 32 бит.";
+		_bppWarning.stringValue = @"Смена глубины цвета откроет другой рабочий стол на сервере, а не вернёт текущий. Сервер запоминает сеанс отдельно для 8, 16 и 32 бит.";
 		_bppWarning.hidden = NO;
 	}
 	else
@@ -303,6 +314,8 @@
 {
 	_server.graphics = [self profileKey];
 	[_server applyGraphicsProfile];
+	if ([_server.graphics isEqualToString:@"extreme"])
+		[_display selectItemAtIndex:1];
 	_width.stringValue = [NSString stringWithFormat:@"%ld", (long)_server.width];
 	_height.stringValue = [NSString stringWithFormat:@"%ld", (long)_server.height];
 	[self refreshBppWarning];
@@ -583,7 +596,9 @@
 	_server.port = port > 0 ? port : 3389;
 	_server.username = username;
 	_server.graphics = [self profileKey];
-	_server.colorDepth = [_server.graphics isEqualToString:@"economy"] ? 16 : 32;
+	_server.colorDepth = [self depthForProfile:_server.graphics];
+	if (![_server.graphics isEqualToString:@"extreme"])
+		_server.profileBeforeExtreme = @{};
 	NSInteger width = [self committedString:_width].integerValue;
 	NSInteger height = [self committedString:_height].integerValue;
 	_server.width = width >= 200 ? width : 1280;

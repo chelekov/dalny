@@ -69,4 +69,32 @@ if ! grep -q -- '-framework QuartzCore' scripts/build-macos.sh; then
 	exit 1
 fi
 
+# Network loss must never close the session window: only windowWillClose ends it.
+if [ "$(grep -c 'DalnySessionFinished' src/SessionWindow.m)" != "1" ] ||
+	! awk '/- \(void\)windowWillClose:/,/^}/' src/SessionWindow.m | grep -q 'DalnySessionFinished'; then
+	echo "SessionWindow must post DalnySessionFinished only from windowWillClose" >&2
+	exit 1
+fi
+for text in 'Связь потеряна — переподключаюсь… (попытка %d)' 'Переподключиться сейчас' 'Плохое соединение' \
+	'Переключиться на экстремальную экономию' 'kReconnectBackoff\[\] = {1, 2, 4, 8, 15, 30}' 'checkAlive'; do
+	if ! grep -q -- "$text" src/SessionWindow.m; then
+		echo "SessionWindow is missing: $text" >&2
+		exit 1
+	fi
+done
+if ! grep -q 'handlers.link' src/session.mm || ! grep -q 'RefreshRect' src/session.mm; then
+	echo "session.mm must probe the link" >&2
+	exit 1
+fi
+# An app-requested stop must never count as a fatal error.
+if [ "$(grep -c 'if (session->stop)' src/session.mm)" -lt 2 ]; then
+	echo "session.mm must clear fatal when the app stopped the session" >&2
+	exit 1
+fi
+if ! grep -q '"extreme"' src/Server.m || ! grep -q 'self.colorDepth = 8' src/Server.m ||
+	! grep -q 'Экстремальная экономия' src/ServerEditor.m || ! grep -q 'profile == 3' src/session.mm; then
+	echo "extreme economy profile is incomplete" >&2
+	exit 1
+fi
+
 echo "tree ok"

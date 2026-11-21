@@ -69,6 +69,12 @@
 	[sessionMenu addItemWithTitle:@"Настроить переключение языка на сервере…"
 	                       action:@selector(configureServerLanguage:)
 	                keyEquivalent:@""];
+	[sessionMenu addItem:[NSMenuItem separatorItem]];
+	[sessionMenu addItemWithTitle:@"Переподключиться" action:@selector(reconnectNow:) keyEquivalent:@""];
+	NSMenuItem* extreme = [sessionMenu addItemWithTitle:@"Экстремальная экономия (640x480, 256 цветов)"
+	                                             action:@selector(toggleExtremeEconomy:)
+	                                      keyEquivalent:@""];
+	extreme.toolTip = @"Для очень плохой связи. Переподключает сеанс; сервер откроет отдельный сеанс в 8 битах.";
 	sessionItem.submenu = sessionMenu;
 	[main addItem:sessionItem];
 

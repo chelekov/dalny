@@ -66,6 +66,10 @@ struct RDPSession
 	char* pendingClipboard;
 	BYTE* pendingDib;
 	UINT32 pendingDibLength;
+	/* When the Mac last offered a picture. The server's clipboard helper re-offers that picture
+	 * as image/png + image/bmp, and xrdp then announces it back to us; the first picture-only
+	 * announcement shortly after is that echo and is not fetched. */
+	uint64_t sentDibMs;
 
 	DispClientContext* disp;
 	int resizeNoteLogged;
@@ -532,8 +536,17 @@ static UINT clip_server_format_list(CliprdrClientContext* cliprdr, const CLIPRDR
 		wanted = CF_DIB;
 	if (wanted == 0 && haveDibV5)
 		wanted = CF_DIBV5;
+	int echo = 0;
+	if ((wanted == CF_DIB || wanted == CF_DIBV5) && session->sentDibMs != 0 &&
+	    now_ms() - session->sentDibMs < 15000)
+		echo = 1;
+	session->sentDibMs = 0;
+	if (echo)
+		wanted = 0;
 	session->requestedFormatId = wanted;
 	pthread_mutex_unlock(&session->lock);
+	if (echo)
+		log_line(session, "Сервер принял картинку из буфера Мака (приложения на сервере видят её как PNG и BMP).");
 
 	if (wanted == 0)
 		return CHANNEL_RC_OK;
@@ -1293,6 +1306,7 @@ void rdp_session_set_clipboard(RDPSession* session, const char* utf8, const uint
 	free(session->pendingDib);
 	session->pendingDib = nullptr;
 	session->pendingDibLength = 0;
+	session->sentDibMs = (dib && dibLength > 0 && !utf8) ? now_ms() : 0;
 	if (dib && dibLength > 0)
 	{
 		session->pendingDib = (BYTE*)malloc(dibLength);

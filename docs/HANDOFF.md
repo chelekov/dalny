@@ -25,7 +25,7 @@ The app name is **Дальний** (bundle id `app.dalny.client`, executable `Da
 - Bits per pixel stay stable per server. xrdp allocates a session per user and color depth. Changing 8/16/32 opens a different desktop. The editor and the extreme-economy switch warn about that.
 - Auto-reconnect is app-level: detect a dead link, back off, read the Keychain again, rebuild the SSH tunnel, log in again. FreeRDP’s reconnect cookie is not enough on xrdp 0.9 and is disabled. Do not set `KillDisconnected=true` on the server.
 - Clipboard is on by default: text (Unicode) and pictures both ways over `cliprdr`. Files are not supported.
-- Keyboard: scancodes, US layout `0x00000409`, language switch on the remote session (XKB `grp:alt_shift_toggle`, layouts `us,ru`). The session window has an **RU/EN** button with the hint «Язык: ⌥ Option + ⇧ Shift» in the title bar (top right). Menu **Подключение → Переключить язык (RU/EN)**, shortcut ⌘⇧Space (⌃Space is the macOS input-source switch). Both send left Alt + left Shift press/release. Physical Option+Shift is forwarded as LMENU+LSHIFT scancodes. Do not use Unicode keyboard mode with xrdp. The Mac input source should stay ABC/US while the session is focused. Command maps to Ctrl by default. ISO Mac keyboards swap grave and section.
+- Keyboard: scancodes, US layout `0x00000409`, language switch on the remote session (XKB `grp:alt_shift_toggle`, layouts `us,ru`). The session window has an **RU/EN** button with the hint «Язык: ⌥ Option + ⇧ Shift» in the title bar (top right). Menu **Подключение → Переключить язык (RU/EN)**, shortcut ⌘⇧Space (⌃Space is the macOS input-source switch). Both send left Alt + left Shift press/release. The server setup keeps `us,ru` + `grp:alt_shift_toggle` alive across xrdp reconnects (see «Fixed in 1.0.9»). Physical Option+Shift is forwarded as LMENU+LSHIFT scancodes. Do not use Unicode keyboard mode with xrdp. The Mac input source should stay ABC/US while the session is focused. Command maps to Ctrl by default. ISO Mac keyboards swap grave and section.
 - Russian UI.
 - Export/import of one server entry without the password or private key. A certificate fingerprint may be included.
 - SSH tunnel on by default for new servers. Local forward to `127.0.0.1` only. Key or password auth. Secrets in the Keychain. Restart the tunnel on reconnect.
@@ -55,7 +55,8 @@ src/Keychain.m             SecItem generic passwords, legacy fallback on -34018
 src/DalnyLog.m             Copyable journal
 src/Updater.m              GitHub Release check, verify, replace, relaunch
 src/ClipboardImage.m       NSPasteboard PNG/TIFF <-> CF_DIB (24-bit BI_RGB out, any BMP in)
-src/LanguageSetup.m        One-click server language setup over SSH, no root
+src/LanguageSetup.m        One-click server setup over SSH, no root (runs resources/server/*)
+resources/server/          setup.sh, dalny-keyboard (layout keeper), dalny-clipboard (png<->bmp)
 src/ServerEditor.m         Short form plus Дополнительно; SSH key create/copy/install
 src/SSHClient.m            ssh-keygen, ssh-keyscan, known_hosts, local forward, askpass
 src/askpass.c              SSH_ASKPASS helper inside Contents/MacOS
@@ -147,10 +148,30 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 - Poor connection: smoothed probe RTT > 800 ms or no answer for 3 s (proven) shows a yellow non-blocking bar at the top of the picture: «Плохое соединение: …», button «Переключиться на экстремальную экономию», «Скрыть». It hides after 10 s of RTT < 500 ms.
 - Extreme economy profile `graphics = "extreme"` (`profileIndex` 3): 640x480 fixed, 8 bpp (256 colors; there is no 1-bit/black-and-white mode in RDP to xrdp), RemoteFX and NSCodec off, wallpaper/themes/menu animations/full-window drag/font smoothing/desktop composition off, cursor shadow and blinking off, bitmap cache and RDP 6.1 compression on, connection type modem. No frame-rate setting exists outside GFX. Switching from the session window (bar button or menu **Подключение → Экстремальная экономия**) asks first, saves the previous profile in `profileBeforeExtreme` (servers.json, not exported), and reconnects; choosing the menu item again restores it. The editor shows a hint per profile, including the separate-session note.
 
+### Fixed in 1.0.9
+
+- Owner report: the RU/EN button and Option+Shift did nothing; only the tray switcher worked, and it could show RU while English was typed. Causes, found on the owner's xrdp 0.9.24 / xorgxrdp 0.9.19 / XFCE server:
+  - xorgxrdp `rdpLoadLayout` runs on every (re)connect and rebuilds the keymap from `base/pc104/us` with empty options (the RDP client layout 0x409 maps to `us`; options would only come from root-owned `xrdp_keyboard.ini`). It does not touch `_XKB_RULES_NAMES`, so `setxkbmap -query` still shows `us,ru` + `grp:alt_shift_toggle` while the real keymap (`xkbcomp -xkb $DISPLAY -`) is `pc+us`. Alt+Shift then has nothing to toggle.
+  - ibus (autostarted by im-launch, `use-system-keyboard-layout=false`, engines `xkb:us::eng` and `xkb:ru::rus`, `next-engine` = `Alt+Shift_L`) runs `setxkbmap` with its own layout (`ru`, `us`, `ru,us`) on engine changes, and its tray icon shows the ibus engine, not the XKB group. That tray icon was the "tray switcher". There was no XFCE xkb plugin on the panel.
+  - An old user autostart entry ran `setxkbmap -layout ru,us`, the opposite group order of the xfconf setting.
+- Server setup (still one click, no root) now runs `resources/server/setup.sh` (bundled in `Contents/Resources/server`, the helpers are passed in as base64 variables):
+  - `dalny-keyboard --watch` (autostart, flock per display): every 2 s compares the `xkb_symbols` name from `xkbcomp` with `+us+ru:2…alt_shift_toggle` and re-applies `setxkbmap -layout us,ru -variant , -option grp:alt_shift_toggle` (other non-`grp:` options kept). Exits when the display is gone.
+  - ibus: `use-system-keyboard-layout true`, keyboard engines reduced to `xkb:us::eng` (non-xkb engines kept), `next-engine`/`next-engine-in-menu`/`prev-engine`/`previous-engine` emptied; old values saved once in `~/.config/dalny/ibus-before.txt`.
+  - Other `~/.config/autostart/*.desktop` with `setxkbmap` get `Hidden=true` (backup `.dalny-backup`).
+  - XFCE panel: when there is no `xkb` plugin, add one before `systray` in that panel (`display-type 1` text, `group-policy 0` global) and hide the ibus tray icon. The panel reads its plugin list only at start; `xfce4-panel -r` raced with itself and left no panel on the test server, so the script does `--quit`, waits, and starts `xfce4-panel` (twice if needed).
+  - Prints `DALNY_IBUS=`, `DALNY_PANEL=added|present|nopanel|skip|fail`, `DALNY_KEYMAP=`, `DALNY_CLIPBOARD=ok|nogtk|nodisplay|fail` besides the old keys. Background helpers are started with a double fork and closed fds so the SSH command returns at once.
+  - After the first frame of every connection to a server with `languageSetup == done`, `LanguageSetup ensureForServer:` runs the same script quietly (log only, no host-key prompt).
+  - The RU/EN button label stays neutral (the client cannot read the server group over RDP). It sends left Alt + left Shift scancodes; with the keeper in place that combination always exists on the server.
+  - Verified on the server: plain `us` keymap uploaded with `xkbcomp` (what a reconnect does) is back to `pc+us+ru:2+group(alt_shift_toggle)` within 2 s; raw XTEST LAlt+LShift (keycodes 64, 50) toggles the group both ways; `ibus engine xkb:ru::rus` no longer changes the keymap. `xdotool key alt+shift` is not a valid test: xdotool locks group 0 around every synthetic key itself.
+- Owner report: a picture copied on the Mac did not paste into an Electron chat app on the server. Cause: xrdp 0.9.24 chansrv offers a client `CF_DIB` to X only as `image/bmp`, and ignores `image/png` from X owners; Chromium/Electron on Linux read and write pictures only as `image/png`. Nothing on the client can change what chansrv advertises.
+  - `dalny-clipboard` (Python 3 + GTK 3, autostart, flock per display): on CLIPBOARD owner change, when the targets have exactly one of `image/bmp` / `image/png` and no text target, it reads the picture and re-offers it with `Gtk.Clipboard.set_image` (png, bmp, jpeg, tiff, …). Its own offer has both formats, so it never loops.
+  - Client: when xrdp announces the helper's re-offer of our own picture (first picture-only server format list within 15 s after the Mac sent a picture without text), the client does not fetch it back (`sentDibMs`), so the Mac pasteboard keeps the original.
+  - Client: pictures other than PNG/TIFF (JPEG, HEIC, PDF from Preview) are drawn through `NSImage` when the pasteboard has no text. When the only text next to a picture is a single link (browsers' "Copy Image"), the link is not sent, so server apps get the picture.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.
-- No file copy through the clipboard. Pictures only through `image/bmp` on the X side.
+- No file copy through the clipboard. xrdp itself moves pictures only as `image/bmp` on the X side; the server helper `dalny-clipboard` adds `image/png` (and back).
 - Changing 8/16/32-bit color starts a different xrdp session.
 - 8 bpp needs xrdp to accept 8-bit clients (stock xrdp 0.9 does). Not tested live yet.
 - Unicode keyboard mode is intentionally absent.

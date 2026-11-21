@@ -1,0 +1,88 @@
+#!/bin/sh
+# Dalny: keeps the us,ru layouts and the Alt+Shift switch in this X session.
+# xorgxrdp loads a plain "us" keymap without options on every reconnect and does not update
+# _XKB_RULES_NAMES, so `setxkbmap -query` keeps showing the old value. This script reads the
+# keymap the X server really uses (xkbcomp) and applies the layouts again when they are gone.
+#   dalny-keyboard --once    apply now if needed, print ok|applied|fail
+#   dalny-keyboard --watch   check every 2 seconds until the display goes away
+LAYOUT=us,ru
+VARIANT=,
+GROUP_OPTION=grp:alt_shift_toggle
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/dalny/keyboard.log"
+
+note() {
+	mkdir -p "${LOG%/*}" 2>/dev/null || return 0
+	if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" 2>/dev/null || echo 0)" -gt 200000 ]; then
+		mv -f "$LOG" "$LOG.old" 2>/dev/null
+	fi
+	printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${DISPLAY:-?}" "$*" >>"$LOG" 2>/dev/null
+}
+
+symbols() {
+	xkbcomp -xkb "$DISPLAY" - 2>/dev/null | sed -n 's/^ *xkb_symbols *"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+good() {
+	if command -v xkbcomp >/dev/null 2>&1; then
+		case "$(symbols)" in
+			*+us+ru:2*alt_shift_toggle*) return 0 ;;
+		esac
+		return 1
+	fi
+	# No xkbcomp: only the root property is left (it may be stale after a reconnect).
+	q=$(setxkbmap -query 2>/dev/null)
+	printf '%s\n' "$q" | grep -q '^layout: *us,ru$' && printf '%s\n' "$q" | grep -q "^options:.*$GROUP_OPTION"
+}
+
+apply() {
+	# Keep the user's other options (for example ctrl:nocaps), replace the group switch.
+	others=$(setxkbmap -query 2>/dev/null | sed -n 's/^options: *//p' | tr ',' '\n' | grep -v '^grp:' | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+	opts=$GROUP_OPTION
+	[ -n "$others" ] && opts="$opts,$others"
+	setxkbmap -layout "$LAYOUT" -variant "$VARIANT" -option '' -option "$opts"
+}
+
+once() {
+	if good; then
+		echo ok
+		return 0
+	fi
+	before=$(symbols 2>/dev/null)
+	if apply && good; then
+		note "applied $LAYOUT $GROUP_OPTION (was: ${before:-unknown})"
+		echo applied
+		return 0
+	fi
+	note "failed to apply (keymap: ${before:-unknown})"
+	echo fail
+	return 1
+}
+
+[ -n "$DISPLAY" ] || { echo "dalny-keyboard: DISPLAY is not set" >&2; exit 2; }
+command -v setxkbmap >/dev/null 2>&1 || { echo "dalny-keyboard: setxkbmap is missing" >&2; exit 2; }
+
+case "$1" in
+	--watch)
+		lockdir="${XDG_RUNTIME_DIR:-/tmp}"
+		lock="$lockdir/dalny-keyboard-$(id -u)-$(printf '%s' "$DISPLAY" | tr -c 'A-Za-z0-9' '_').lock"
+		if command -v flock >/dev/null 2>&1; then
+			exec 9>"$lock" || exit 1
+			flock -n 9 || exit 0
+		fi
+		note "watch started (pid $$)"
+		lost=0
+		while :; do
+			if setxkbmap -query >/dev/null 2>&1; then
+				lost=0
+				good || once >/dev/null
+			else
+				lost=$((lost + 1))
+				[ "$lost" -ge 5 ] && { note "display is gone, watch stopped"; exit 0; }
+			fi
+			sleep 2
+		done
+		;;
+	*)
+		once
+		;;
+esac

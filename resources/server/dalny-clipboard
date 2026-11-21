@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Dalny: picture formats for the X clipboard of an xrdp session.
+
+xrdp 0.9 chansrv knows one picture format, image/bmp. A picture copied on the client becomes
+image/bmp only, and Chromium/Electron apps paste image/png only, so they see nothing.
+Pictures copied in those apps offer image/png only, which chansrv cannot send to the client.
+
+When the clipboard holds a picture in just one of the two formats (and no text), this helper
+takes the picture and offers it again through GTK, which serves image/png, image/bmp and the
+other picture types. Text is never touched.
+"""
+import fcntl
+import os
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+MAX_BYTES = 64 * 1024 * 1024
+TEXT_TARGETS = {"UTF8_STRING", "STRING", "TEXT", "COMPOUND_TEXT", "text/plain",
+                "text/plain;charset=utf-8", "text/html", "text/uri-list",
+                "x-special/gnome-copied-files"}
+
+
+def log(message):
+    path = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                        "dalny", "clipboard.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 200000:
+            os.replace(path, path + ".old")
+        with open(path, "a", encoding="utf-8") as out:
+            out.write("%s %s %s\n" % (GLib.DateTime.new_now_local().format("%Y-%m-%d %H:%M:%S"),
+                                      os.environ.get("DISPLAY", "?"), message))
+    except OSError:
+        pass
+
+
+class Bridge:
+    def __init__(self):
+        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.generation = 0
+        self.clipboard.connect("owner-change", self.on_owner_change)
+        self.on_owner_change(self.clipboard, None)
+
+    def on_owner_change(self, clipboard, event):
+        self.generation += 1
+        generation = self.generation
+        clipboard.request_targets(lambda cb, atoms, n: self.on_targets(generation, atoms))
+
+    def on_targets(self, generation, atoms):
+        if generation != self.generation or not atoms:
+            return
+        names = {atom.name() for atom in atoms}
+        if names & TEXT_TARGETS:
+            return
+        has_png = "image/png" in names
+        has_bmp = "image/bmp" in names
+        if has_bmp and not has_png:
+            source = "image/bmp"
+        elif has_png and not has_bmp:
+            source = "image/png"
+        else:
+            return
+        self.clipboard.request_contents(Gdk.Atom.intern(source, False),
+                                        lambda cb, data: self.on_data(generation, source, data))
+
+    def on_data(self, generation, source, data):
+        if generation != self.generation or data is None:
+            return
+        raw = data.get_data()
+        if not raw or len(raw) > MAX_BYTES:
+            return
+        loader = GdkPixbuf.PixbufLoader()
+        try:
+            loader.write(raw)
+            loader.close()
+        except GLib.Error as error:
+            log("cannot read %s: %s" % (source, error.message))
+            return
+        pixbuf = loader.get_pixbuf()
+        if pixbuf is None:
+            return
+        self.clipboard.set_image(pixbuf)
+        log("picture %dx%d from %s offered as image/png and image/bmp"
+            % (pixbuf.get_width(), pixbuf.get_height(), source))
+
+
+def main():
+    display = os.environ.get("DISPLAY", "")
+    if not display:
+        print("dalny-clipboard: DISPLAY is not set", file=sys.stderr)
+        return 2
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    safe = "".join(c if c.isalnum() else "_" for c in display)
+    lock = open(os.path.join(runtime, "dalny-clipboard-%d-%s.lock" % (os.getuid(), safe)), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    if not Gtk.init_check(sys.argv)[0]:
+        print("dalny-clipboard: cannot open the display", file=sys.stderr)
+        return 1
+    Bridge()
+    log("started (pid %d)" % os.getpid())
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

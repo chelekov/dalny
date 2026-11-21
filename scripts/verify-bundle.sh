@@ -79,6 +79,12 @@ if [[ "$clipboard_ok" != "1" ]]; then
 	fail=1
 fi
 
+for helper in setup.sh dalny-keyboard dalny-clipboard; do
+	if [[ ! -s "$APP/Contents/Resources/server/$helper" ]]; then
+		echo "server helper $helper was not bundled" >&2
+		fail=1
+	fi
+done
 if [[ ! -s "$APP/Contents/Resources/AppIcon.icns" ]]; then
 	echo "AppIcon.icns was not bundled" >&2
 	fail=1

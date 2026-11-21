@@ -259,6 +259,10 @@ for size in 16 32 128 256 512; do
 	sips -z "$double" "$double" resources/AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+# Server helpers that the one-click server setup installs for the SSH user (no root).
+mkdir -p "$APP/Contents/Resources/server"
+cp resources/server/setup.sh resources/server/dalny-keyboard resources/server/dalny-clipboard \
+	"$APP/Contents/Resources/server/"
 VERSION="1.0.0"
 BUILD="1"
 if [[ -n "${GITHUB_RUN_NUMBER:-}" ]]; then

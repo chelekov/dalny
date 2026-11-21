@@ -569,15 +569,28 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	return YES;
 }
 
-// Once per server, after the first picture of a session arrives: offer the server setup.
+// After the first picture of each connection. A server that was set up gets a quiet check
+// (helpers running, layouts in place: xorgxrdp resets them on reconnect). Otherwise, once per
+// server, offer the setup.
 - (void)maybeOfferLanguageSetup
 {
-	if (_languageOfferShown || _server.languageSetup.length > 0 || !_server.sshEnabled || _cancelled)
+	if (!_server.sshEnabled || _cancelled)
+		return;
+	if ([_server.languageSetup isEqualToString:@"done"])
+	{
+		__weak typeof(self) weakSelf = self;
+		[LanguageSetup ensureForServer:_server
+		                           log:^(NSString* line) {
+			                           [weakSelf appendLog:line];
+		                           }];
+		return;
+	}
+	if (_languageOfferShown || _server.languageSetup.length > 0)
 		return;
 	_languageOfferShown = YES;
 	NSAlert* alert = [NSAlert new];
-	alert.messageText = @"Настроить переключение языка на сервере?";
-	alert.informativeText = @"Дальний по SSH, без sudo, включит на сервере раскладки us и ru и переключение ⌥ Option + ⇧ Shift (настройки XFCE и текущий сеанс). Это можно сделать и позже: меню «Подключение» → «Настроить переключение языка на сервере…».";
+	alert.messageText = @"Настроить сервер: язык и картинки в буфере?";
+	alert.informativeText = @"Дальний по SSH, без sudo, включит на сервере раскладки us и ru с переключением ⌥ Option + ⇧ Shift и будет держать их после переподключений, а ещё научит буфер обмена отдавать картинки приложениям на Chromium/Electron. Меняются только настройки этого пользователя. Это можно сделать и позже: меню «Подключение» → «Настроить сервер (язык, буфер обмена)…».";
 	[alert addButtonWithTitle:@"Настроить"];
 	[alert addButtonWithTitle:@"Не надо"];
 	__weak typeof(self) weakSelf = self;
@@ -1334,6 +1347,8 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	NSData* dib = [ClipboardImage dibFromPasteboard:pasteboard maxPixels:20000000 reason:&reason];
 	if (reason)
 		[self appendLog:reason];
+	if (dib && text && [ClipboardImage isLinkText:text])
+		text = nil;
 	if (!text && !dib)
 		return;
 	rdp_session_set_clipboard(_rdp, text.UTF8String, dib.bytes, dib.length);

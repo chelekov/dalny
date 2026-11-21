@@ -54,9 +54,40 @@ if ! grep -q 'CF_DIB' src/session.mm || ! grep -q 'rdp_session_send_language_tog
 	exit 1
 fi
 
-# Language setup runs as the SSH user. It must never ask for root.
-if grep -n -w 'sudo' src/LanguageSetup.m; then
-	echo "LanguageSetup.m must not use sudo" >&2
+# Server setup runs as the SSH user. It must never ask for root.
+if grep -n -w 'sudo' src/LanguageSetup.m resources/server/*; then
+	echo "LanguageSetup.m and the server helpers must not use sudo" >&2
+	exit 1
+fi
+# Server helpers: POSIX sh and Python 3, bundled by build-macos.sh and checked by verify-bundle.sh.
+for script in resources/server/setup.sh resources/server/dalny-keyboard; do
+	sh -n "$script"
+	if command -v dash >/dev/null 2>&1; then dash -n "$script"; fi
+done
+python3 - <<'PY'
+import ast
+from pathlib import Path
+ast.parse(Path("resources/server/dalny-clipboard").read_text(), "dalny-clipboard")
+PY
+for text in 'xkbcomp -xkb' 'grp:alt_shift_toggle' '--watch'; do
+	if ! grep -q -- "$text" resources/server/dalny-keyboard; then
+		echo "dalny-keyboard is missing: $text" >&2
+		exit 1
+	fi
+done
+for text in 'use-system-keyboard-layout true' 'DALNY_CLIPBOARD=' 'DALNY_IBUS=' 'autostart'; do
+	if ! grep -q -- "$text" resources/server/setup.sh; then
+		echo "setup.sh is missing: $text" >&2
+		exit 1
+	fi
+done
+if ! grep -q 'resources/server/setup.sh' scripts/build-macos.sh || ! grep -q 'Resources/server' scripts/verify-bundle.sh; then
+	echo "server helpers must be bundled and verified" >&2
+	exit 1
+fi
+# Mac -> server pictures: the echo of our own picture must not be fetched back.
+if ! grep -q 'sentDibMs' src/session.mm || ! grep -q 'isLinkText' src/SessionWindow.m; then
+	echo "picture clipboard echo guard or link filter is missing" >&2
 	exit 1
 fi
 

@@ -66,7 +66,7 @@
 	                                     keyEquivalent:@" "];
 	toggle.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
 	toggle.toolTip = @"Отправляет на сервер ⌥ Option + ⇧ Shift. Можно и просто нажать ⌥ Option + ⇧ Shift.";
-	[sessionMenu addItemWithTitle:@"Настроить переключение языка на сервере…"
+	[sessionMenu addItemWithTitle:@"Настроить сервер (язык, буфер обмена)…"
 	                       action:@selector(configureServerLanguage:)
 	                keyEquivalent:@""];
 	[sessionMenu addItem:[NSMenuItem separatorItem]];

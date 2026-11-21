@@ -12,74 +12,25 @@ static NSString* const kManualCommand =
 
 @implementation LanguageSetup
 
-+ (NSString*)remoteScript
++ (nullable NSString*)resource:(NSString*)name
 {
-	return @"export LC_ALL=C\n"
-	        @"uid=$(id -u)\n"
-	        @"DISP=''; BUS=''; XA=''; best=-1\n"
-	        @"# Find the user's X display: xrdp sessions use :10 and up. Prefer a process that also\n"
-	        @"# knows the session D-Bus (xfconf needs it).\n"
-	        @"for p in $(pgrep -u \"$uid\" 2>/dev/null); do\n"
-	        @"  [ -r \"/proc/$p/environ\" ] || continue\n"
-	        @"  env=$( { tr '\\000' '\\n' < \"/proc/$p/environ\"; } 2>/dev/null) || continue\n"
-	        @"  d=$(printf '%s\\n' \"$env\" | sed -n 's/^DISPLAY=//p' | head -n 1)\n"
-	        @"  case \"$d\" in :*) ;; *) continue ;; esac\n"
-	        @"  n=${d#:}; n=${n%%.*}\n"
-	        @"  case \"$n\" in ''|*[!0-9]*) continue ;; esac\n"
-	        @"  b=$(printf '%s\\n' \"$env\" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n 1)\n"
-	        @"  score=$n\n"
-	        @"  [ -n \"$b\" ] && score=$((score + 1000))\n"
-	        @"  [ \"$n\" -ge 10 ] && score=$((score + 100000))\n"
-	        @"  if [ \"$score\" -gt \"$best\" ]; then\n"
-	        @"    best=$score; DISP=$d; BUS=$b\n"
-	        @"    XA=$(printf '%s\\n' \"$env\" | sed -n 's/^XAUTHORITY=//p' | head -n 1)\n"
-	        @"  fi\n"
-	        @"done\n"
-	        @"echo \"DALNY_DISPLAY=${DISP:-none}\"\n"
-	        @"xf=skip\n"
-	        @"if command -v xfconf-query >/dev/null 2>&1; then\n"
-	        @"  xq() { if [ -n \"$BUS\" ]; then DBUS_SESSION_BUS_ADDRESS=\"$BUS\" xfconf-query \"$@\"; else xfconf-query \"$@\"; fi; }\n"
-	        @"  setp() { xq -c keyboard-layout -p \"$1\" -n -t \"$2\" -s \"$3\" 2>/dev/null || xq -c keyboard-layout -p \"$1\" -s \"$3\"; }\n"
-	        @"  if [ -n \"$BUS\" ] || pgrep -u \"$uid\" -x xfconfd >/dev/null 2>&1; then\n"
-	        @"    if setp /Default/XkbDisable bool false && setp /Default/XkbLayout string us,ru &&\n"
-	        @"       setp /Default/XkbVariant string , && setp /Default/XkbOptions/Group string grp:alt_shift_toggle; then\n"
-	        @"      xf=ok\n"
-	        @"    else\n"
-	        @"      xf=fail\n"
-	        @"    fi\n"
-	        @"  else\n"
-	        @"    # No running XFCE session: write the channel file, xfconfd reads it at the next login.\n"
-	        @"    f=\"$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/keyboard-layout.xml\"\n"
-	        @"    mkdir -p \"${f%/*}\"\n"
-	        @"    [ -f \"$f\" ] && cp -p \"$f\" \"$f.dalny-backup\"\n"
-	        @"    cat > \"$f\" <<'XML'\n"
-	        @"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-	        @"<channel name=\"keyboard-layout\" version=\"1.0\">\n"
-	        @"  <property name=\"Default\" type=\"empty\">\n"
-	        @"    <property name=\"XkbDisable\" type=\"bool\" value=\"false\"/>\n"
-	        @"    <property name=\"XkbLayout\" type=\"string\" value=\"us,ru\"/>\n"
-	        @"    <property name=\"XkbVariant\" type=\"string\" value=\",\"/>\n"
-	        @"    <property name=\"XkbOptions\" type=\"empty\">\n"
-	        @"      <property name=\"Group\" type=\"string\" value=\"grp:alt_shift_toggle\"/>\n"
-	        @"    </property>\n"
-	        @"  </property>\n"
-	        @"</channel>\n"
-	        @"XML\n"
-	        @"    xf=file\n"
-	        @"  fi\n"
-	        @"fi\n"
-	        @"sx=missing\n"
-	        @"if command -v setxkbmap >/dev/null 2>&1; then\n"
-	        @"  if [ -z \"$DISP\" ]; then\n"
-	        @"    sx=nodisplay\n"
-	        @"  elif DISPLAY=\"$DISP\" XAUTHORITY=\"${XA:-$HOME/.Xauthority}\" setxkbmap -layout us,ru -variant , -option grp:alt_shift_toggle; then\n"
-	        @"    sx=ok\n"
-	        @"  else\n"
-	        @"    sx=fail\n"
-	        @"  fi\n"
-	        @"fi\n"
-	        @"echo \"DALNY_XFCONF=$xf\"\n"
-	        @"echo \"DALNY_SETXKBMAP=$sx\"\n";
+	NSString* path = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:
+	                                                           [@"server" stringByAppendingPathComponent:name]];
+	NSData* data = [NSData dataWithContentsOfFile:path];
+	return data.length ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
+
++ (nullable NSString*)remoteScript
+{
+	NSString* setup = [self resource:@"setup.sh"];
+	NSString* keyboard = [self resource:@"dalny-keyboard"];
+	NSString* clipboard = [self resource:@"dalny-clipboard"];
+	if (!setup || !keyboard || !clipboard)
+		return nil;
+	/* base64 has no quotes, so single quotes are safe. */
+	NSString* kb = [[keyboard dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+	NSString* cb = [[clipboard dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+	return [NSString stringWithFormat:@"DALNY_KB_B64='%@'\nDALNY_CB_B64='%@'\n%@", kb, cb, setup];
 }
 
 + (NSString*)valueFor:(NSString*)key inOutput:(NSString*)output
@@ -112,6 +63,7 @@ static NSString* const kManualCommand =
 }
 
 + (void)runForServer:(DalnyServer*)server
+               quiet:(BOOL)quiet
                  log:(void (^)(NSString* line))log
                 done:(void (^)(BOOL ok, NSString* title, NSString* detail))done
 {
@@ -125,6 +77,12 @@ static NSString* const kManualCommand =
 		finish(NO, @"Нужен SSH",
 		       [NSString stringWithFormat:@"Для этого сервера SSH выключен. Включите SSH в настройках сервера или выполните на сервере в терминале сеанса:\n\n%@",
 		                                  kManualCommand]);
+		return;
+	}
+	NSString* script = [self remoteScript];
+	if (!script)
+	{
+		finish(NO, @"Не удалось настроить сервер", @"В программе нет файлов настройки сервера (Contents/Resources/server). Переустановите Дальний.");
 		return;
 	}
 	NSString* host = server.effectiveSSHHost;
@@ -143,16 +101,17 @@ static NSString* const kManualCommand =
 			       secretError.localizedDescription ?: @"В Связке ключей нет пароля или ключа SSH для этого сервера.");
 			return;
 		}
-		log(@"Настраиваю переключение языка на сервере (от имени пользователя, без прав root)…");
+		log(quiet ? @"Проверяю настройку сервера (язык, буфер обмена)…"
+		          : @"Настраиваю сервер: язык и картинки в буфере обмена (от имени пользователя, без прав root)…");
 		NSError* error = nil;
-		NSString* output = [SSHClient runScript:[self remoteScript]
+		NSString* output = [SSHClient runScript:script
 		                                   host:host
 		                                   port:port
 		                               username:user
 		                                 keyPEM:key
 		                               password:password
 		                                askHost:^BOOL(NSString* fingerprint, BOOL changed) {
-			                                return [self askHost:fingerprint changed:changed];
+			                                return quiet ? NO : [self askHost:fingerprint changed:changed];
 		                                }
 		                                    log:log
 		                                  error:&error];
@@ -160,7 +119,7 @@ static NSString* const kManualCommand =
 		{
 			NSString* why = error.localizedDescription ?: @"Команда SSH не выполнилась.";
 			log(why);
-			finish(NO, @"Не удалось настроить язык", why);
+			finish(NO, @"Не удалось настроить сервер", why);
 			return;
 		}
 		for (NSString* line in [output componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]])
@@ -171,36 +130,68 @@ static NSString* const kManualCommand =
 		}
 		NSString* xf = [self valueFor:@"DALNY_XFCONF" inOutput:output];
 		NSString* sx = [self valueFor:@"DALNY_SETXKBMAP" inOutput:output];
+		NSString* ib = [self valueFor:@"DALNY_IBUS" inOutput:output];
+		NSString* pn = [self valueFor:@"DALNY_PANEL" inOutput:output];
+		NSString* cb = [self valueFor:@"DALNY_CLIPBOARD" inOutput:output];
 		BOOL saved = [xf isEqualToString:@"ok"] || [xf isEqualToString:@"file"];
 		BOOL live = [sx isEqualToString:@"ok"];
-		NSString* keys = @"Язык переключается ⌥ Option + ⇧ Shift или кнопкой RU/EN в окне сеанса.";
+		NSMutableArray<NSString*>* notes = [NSMutableArray array];
+		if ([ib isEqualToString:@"ok"])
+			[notes addObject:@"ibus больше не меняет раскладку сам."];
+		else if ([ib isEqualToString:@"fail"])
+			[notes addObject:@"Настройки ibus не записались — он может снова сбивать раскладку."];
+		if ([pn isEqualToString:@"added"])
+			[notes addObject:@"На панель XFCE рядом с треем добавлен индикатор раскладки (us/ru); значок ibus скрыт."];
+		else if ([pn isEqualToString:@"nopanel"])
+			[notes addObject:@"Индикатор раскладки добавлен, но панель XFCE не перезапустилась — он появится после нового входа."];
+		if ([cb isEqualToString:@"ok"])
+			[notes addObject:@"Картинки из буфера Мака теперь вставляются и в приложения на Chromium/Electron."];
+		else if ([cb isEqualToString:@"nogtk"])
+			[notes addObject:@"Помощник для картинок не установлен: на сервере нет python3 с GTK 3 (пакет python3-gi). Картинки вставятся в приложения, понимающие image/bmp."];
+		else if ([cb isEqualToString:@"fail"])
+			[notes addObject:@"Помощник для картинок не установился, подробности в журнале."];
+		NSString* extra = notes.count ? [@"\n\n" stringByAppendingString:[notes componentsJoinedByString:@"\n"]] : @"";
+		NSString* keys = @"Язык переключается ⌥ Option + ⇧ Shift или кнопкой RU/EN в окне сеанса. После переподключения раскладка восстанавливается сама за 2 секунды, язык — английский.";
 		if (saved && live)
-			finish(YES, @"Переключение языка настроено",
-			       [NSString stringWithFormat:@"Раскладки us и ru включены в настройках XFCE и в текущем сеансе. %@", keys]);
+			finish(YES, @"Сервер настроен",
+			       [NSString stringWithFormat:@"Раскладки us и ru включены в XFCE, в текущем сеансе и после каждого переподключения. %@%@", keys, extra]);
 		else if (saved)
-			finish(YES, @"Переключение языка сохранено",
-			       [NSString stringWithFormat:@"Настройка записана в XFCE. Открытого сеанса не нашлось, поэтому она заработает после переподключения. %@", keys]);
+			finish(YES, @"Настройка сохранена",
+			       [NSString stringWithFormat:@"Настройка записана. Открытого сеанса не нашлось, поэтому она заработает после входа. %@%@", keys, extra]);
 		else if (live && [xf isEqualToString:@"skip"])
-			finish(YES, @"Язык включён в текущем сеансе",
-			       [NSString stringWithFormat:@"На сервере не XFCE (нет xfconf-query), поэтому после нового входа настройка может пропасть. Как сохранить её навсегда — в README, раздел «Клавиатура». %@", keys]);
+			finish(YES, @"Язык включён",
+			       [NSString stringWithFormat:@"На сервере не XFCE (нет xfconf-query); раскладку держит помощник из автозапуска. %@%@", keys, extra]);
 		else if (live)
 			finish(NO, @"Язык включён только в текущем сеансе",
-			       [NSString stringWithFormat:@"setxkbmap сработал, а настройки XFCE не записались. Подробности — в журнале. %@", keys]);
+			       [NSString stringWithFormat:@"setxkbmap сработал, а настройки XFCE не записались. Подробности — в журнале. %@%@", keys, extra]);
 		else
 		{
 			NSString* why = [sx isEqualToString:@"missing"] ? @"на сервере нет setxkbmap"
 			              : ([sx isEqualToString:@"nodisplay"] ? @"не найден открытый сеанс xrdp" : @"команда не сработала");
 			finish(NO, @"Не удалось настроить язык",
-			       [NSString stringWithFormat:@"Причина: %@. Подробности — в журнале. Вручную в терминале сеанса:\n\n%@", why,
-			                                  kManualCommand]);
+			       [NSString stringWithFormat:@"Причина: %@. Подробности — в журнале. Вручную в терминале сеанса:\n\n%@%@", why,
+			                                  kManualCommand, extra]);
 		}
 	});
+}
+
++ (void)ensureForServer:(DalnyServer*)server log:(void (^)(NSString* line))log
+{
+	[self runForServer:server
+	             quiet:YES
+	               log:log
+	              done:^(BOOL ok, NSString* title, NSString* detail) {
+		              (void)detail;
+		              log(ok ? @"Настройка сервера на месте (раскладка us,ru и Alt+Shift, картинки в буфере)."
+		                     : [NSString stringWithFormat:@"Проверка настройки сервера: %@.", title]);
+	              }];
 }
 
 + (void)runInteractiveForServer:(DalnyServer*)server window:(NSWindow*)window log:(void (^)(NSString* line))log
 {
 	__weak NSWindow* weakWindow = window;
 	[self runForServer:server
+	             quiet:NO
 	               log:log
 	              done:^(BOOL ok, NSString* title, NSString* detail) {
 		              log([NSString stringWithFormat:@"%@. %@", title, detail]);

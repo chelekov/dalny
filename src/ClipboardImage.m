@@ -60,6 +60,20 @@ static void put_le16(uint8_t* p, uint16_t v)
 	return file;
 }
 
++ (BOOL)isLinkText:(NSString*)text
+{
+	NSString* trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if (trimmed.length == 0 || trimmed.length > 8192)
+		return NO;
+	if ([trimmed rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound)
+		return NO;
+	NSString* lower = trimmed.lowercaseString;
+	for (NSString* scheme in @[ @"http://", @"https://", @"file://", @"data:", @"blob:" ])
+		if ([lower hasPrefix:scheme])
+			return YES;
+	return NO;
+}
+
 + (BOOL)writeDIB:(NSData*)dib toPasteboard:(NSPasteboard*)pasteboard
 {
 	NSData* bmp = [self bmpFileFromDIB:dib];
@@ -96,14 +110,24 @@ static void put_le16(uint8_t* p, uint16_t v)
 			*reason = @"Файлы через буфер обмена не передаются, только текст и картинки.";
 		return nil;
 	}
+	/* Screenshots (⌘⌃⇧4) put PNG, Preview and Safari put TIFF (often PNG too). Anything else
+	 * NSImage can read (JPEG, HEIC, PDF from Preview) is drawn into a bitmap, but only when there
+	 * is no text: rich text from editors also carries a PDF picture of itself. */
+	CGImageRef image = NULL;
 	NSString* type = [pasteboard availableTypeFromArray:@[ NSPasteboardTypePNG, NSPasteboardTypeTIFF ]];
-	if (!type)
-		return nil;
-	NSData* data = [pasteboard dataForType:type];
-	if (data.length == 0)
-		return nil;
-	NSBitmapImageRep* rep = [NSBitmapImageRep imageRepWithData:data];
-	CGImageRef image = rep.CGImage;
+	NSData* data = type ? [pasteboard dataForType:type] : nil;
+	NSBitmapImageRep* rep __attribute__((objc_precise_lifetime)) = data.length ? [NSBitmapImageRep imageRepWithData:data] : nil;
+	image = rep.CGImage;
+	/* Keeps the CGImage below alive until the end of the method. */
+	NSImage* fallback __attribute__((objc_precise_lifetime)) = nil;
+	if (!image && ![pasteboard availableTypeFromArray:@[ NSPasteboardTypeString ]] &&
+	    [NSImage canInitWithPasteboard:pasteboard])
+	{
+		fallback = [[NSImage alloc] initWithPasteboard:pasteboard];
+		NSRect rect = NSMakeRect(0, 0, fallback.size.width, fallback.size.height);
+		if (fallback && rect.size.width >= 1 && rect.size.height >= 1)
+			image = [fallback CGImageForProposedRect:&rect context:nil hints:nil];
+	}
 	if (!image)
 		return nil;
 	size_t width = CGImageGetWidth(image);

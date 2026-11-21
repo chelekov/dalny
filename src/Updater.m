@@ -3,6 +3,7 @@
 #import "Keychain.h"
 #import <Cocoa/Cocoa.h>
 #import <spawn.h>
+#import <sys/stat.h>
 #import <unistd.h>
 
 extern char** environ;

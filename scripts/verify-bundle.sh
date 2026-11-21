@@ -79,6 +79,15 @@ if [[ "$clipboard_ok" != "1" ]]; then
 	fail=1
 fi
 
+if [[ ! -s "$APP/Contents/Resources/AppIcon.icns" ]]; then
+	echo "AppIcon.icns was not bundled" >&2
+	fail=1
+fi
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP/Contents/Info.plist" 2>/dev/null)" != "AppIcon" ]]; then
+	echo "CFBundleIconFile must be AppIcon" >&2
+	fail=1
+fi
+
 if [[ "$fail" != "0" ]]; then
 	exit 1
 fi

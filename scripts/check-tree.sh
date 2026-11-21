@@ -18,6 +18,14 @@ if bundle != "app.dalny.client":
     raise SystemExit(f"unexpected bundle id: {bundle}")
 if info.get("LSMinimumSystemVersion") != "12.0":
     raise SystemExit("LSMinimumSystemVersion must be 12.0")
+if info.get("CFBundleIconFile") != "AppIcon":
+    raise SystemExit("CFBundleIconFile must be AppIcon")
+png = Path("resources/AppIcon.png").read_bytes()
+if png[:8] != b"\x89PNG\r\n\x1a\n" or png[12:16] != b"IHDR":
+    raise SystemExit("resources/AppIcon.png must be a PNG")
+w, h = int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big")
+if (w, h) != (1024, 1024):
+    raise SystemExit(f"resources/AppIcon.png must be 1024x1024, got {w}x{h}")
 PY
 
 if grep -R -n --exclude-dir=.git --exclude=check-tree.sh -e 'chelekov' . | grep -v 'chelekov/dalny'; then

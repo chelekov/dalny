@@ -88,9 +88,10 @@ FreeRDP channels are built into `libfreerdp-client3` (static table). A small pro
 2. Build OpenSSL shared for the requested architectures with `-mmacosx-version-min=12.0`. A universal build lipos x86_64 and arm64.
 3. Configure FreeRDP with Ninja, `CMAKE_OSX_ARCHITECTURES` set to the same list, `CMAKE_OSX_DEPLOYMENT_TARGET=12.0`, shared libs, client only, no SDL, no Mac client sample, no FFmpeg, no H.264, no server. `WITH_JSON_DISABLED=ON` and `CMAKE_IGNORE_PREFIX_PATH=/usr/local;/opt/homebrew`. Pass `-DUSE_VERSION_FROM_GIT_TAG=OFF` so a tag on this repository is not read as the FreeRDP version (that installs headers under `freerdp1` instead of `freerdp3`).
 4. Compile the app with `clang`/`clang++` and `-mmacosx-version-min=12.0`. C and Objective-C files pass `-Dnullptr=NULL` because FreeRDP headers use `nullptr`.
-5. Copy dylibs into `Contents/Frameworks`, rewrite ids and deps to `@rpath`, sign inside-out with `codesign --sign -`.
-6. `scripts/verify-bundle.sh` checks architectures, minos 12.x, dependencies, and clipboard.
-7. `ditto` writes `dist/Dalny-macos.zip`.
+5. Build `Contents/Resources/AppIcon.icns` from `resources/AppIcon.png` (1024x1024) with `sips` and `iconutil`, sizes 16..512 plus @2x. `Info.plist` points to it with `CFBundleIconFile=AppIcon`.
+6. Copy dylibs into `Contents/Frameworks`, rewrite ids and deps to `@rpath`, sign inside-out with `codesign --sign -`.
+7. `scripts/verify-bundle.sh` checks architectures, minos 12.x, dependencies, clipboard, and the icon.
+8. `ditto` writes `dist/Dalny-macos.zip`.
 
 Each macOS run rebuilds OpenSSL and FreeRDP from scratch. There is no cache.
 

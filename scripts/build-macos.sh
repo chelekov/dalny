@@ -249,6 +249,16 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resourc
 cp "$WORK/Dalny" "$APP/Contents/MacOS/Dalny"
 cp "$WORK/DalnyAskpass" "$APP/Contents/MacOS/DalnyAskpass"
 cp src/Info.plist "$APP/Contents/Info.plist"
+# App icon: every size 16..1024 (with @2x) from the 1024 source PNG.
+ICONSET="$WORK/AppIcon.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+	sips -z "$size" "$size" resources/AppIcon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+	double=$((size * 2))
+	sips -z "$double" "$double" resources/AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 VERSION="1.0.0"
 BUILD="1"
 if [[ -n "${GITHUB_RUN_NUMBER:-}" ]]; then

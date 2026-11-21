@@ -1,5 +1,6 @@
 #import "RDPView.h"
 #import "AppleKeyboard.h"
+#import <QuartzCore/QuartzCore.h>
 #import <freerdp/scancode.h>
 
 static const NSEventModifierFlags kFlagLShift = 0x000002;
@@ -21,6 +22,7 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 	NSEventModifierFlags _previousFlags;
 	BOOL _isoKeyboard;
 	NSTrackingArea* _tracking;
+	CALayer* _imageLayer;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -34,6 +36,16 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 		_isoKeyboard = dalny_mac_keyboard_is_iso();
 		self.wantsLayer = YES;
 		self.layer.backgroundColor = NSColor.blackColor.CGColor;
+		/* The picture lives in its own layer placed at imageRect, so drawing and mouse mapping
+		 * use the same rectangle. Unfilled parts of the view stay black. */
+		_imageLayer = [CALayer layer];
+		_imageLayer.contentsGravity = kCAGravityResize;
+		_imageLayer.magnificationFilter = kCAFilterLinear;
+		_imageLayer.minificationFilter = kCAFilterTrilinear;
+		_imageLayer.backgroundColor = NSColor.blackColor.CGColor;
+		_imageLayer.actions = @{ @"contents" : [NSNull null], @"bounds" : [NSNull null],
+		                         @"position" : [NSNull null], @"frame" : [NSNull null] };
+		[self.layer addSublayer:_imageLayer];
 	}
 	return self;
 }
@@ -68,10 +80,50 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 	[self addTrackingArea:_tracking];
 }
 
+- (BOOL)isOpaque
+{
+	return YES;
+}
+
+- (void)setFitDisplay:(BOOL)fitDisplay
+{
+	_fitDisplay = fitDisplay;
+	[self placeImageLayer];
+}
+
+- (void)layout
+{
+	[super layout];
+	[self placeImageLayer];
+}
+
+- (void)setFrameSize:(NSSize)newSize
+{
+	[super setFrameSize:newSize];
+	[self placeImageLayer];
+}
+
+- (void)placeImageLayer
+{
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	_imageLayer.frame = NSRectToCGRect([self imageRect]);
+	[CATransaction commit];
+}
+
+/* Main thread only. */
 - (void)noteRemoteSizeWidth:(int)width height:(int)height
 {
+	if (width <= 0 || height <= 0 || (width == _remoteWidth && height == _remoteHeight))
+		return;
 	_remoteWidth = width;
 	_remoteHeight = height;
+	[self placeImageLayer];
+}
+
+- (NSSize)remoteSize
+{
+	return NSMakeSize(_remoteWidth, _remoteHeight);
 }
 
 - (void)updateFrameWithBytes:(const uint8_t*)bytes
@@ -81,8 +133,6 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 {
 	if (!bytes || width <= 0 || height <= 0 || stride < width * 4)
 		return;
-	_remoteWidth = width;
-	_remoteHeight = height;
 	size_t bytesNeeded = (size_t)stride * (size_t)height;
 	CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes, bytesNeeded);
 	CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
@@ -100,23 +150,32 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 	CGImageRef shown = image ? CGImageRetain(image) : NULL;
 	[_lock unlock];
 	dispatch_async(dispatch_get_main_queue(), ^{
-		self.layer.contents = shown ? (__bridge id)shown : nil;
+		[self noteRemoteSizeWidth:width height:height];
+		[CATransaction begin];
+		[CATransaction setDisableActions:YES];
+		self->_imageLayer.contents = shown ? (__bridge id)shown : nil;
+		[CATransaction commit];
 		if (shown)
 			CGImageRelease(shown);
 	});
 }
 
+/* Where the remote picture is drawn, in view points. The aspect ratio is always kept.
+ * Fixed mode: one remote pixel is one point (Retina shows it sharp at 2x), scaled down only
+ * when the view is smaller. Fit and full screen: scaled to fit the view (the server size is
+ * view points x backing scale, so on Retina the scale is about 1/2). */
 - (NSRect)imageRect
 {
-	if (_remoteWidth <= 0 || _remoteHeight <= 0)
-		return self.bounds;
 	NSRect bounds = self.bounds;
+	if (_remoteWidth <= 0 || _remoteHeight <= 0 || bounds.size.width < 1 || bounds.size.height < 1)
+		return bounds;
 	CGFloat scale = MIN(bounds.size.width / _remoteWidth, bounds.size.height / _remoteHeight);
 	if (!_fitDisplay)
 		scale = MIN(scale, 1.0);
 	CGFloat width = _remoteWidth * scale;
 	CGFloat height = _remoteHeight * scale;
-	return NSMakeRect(NSMidX(bounds) - width / 2.0, NSMidY(bounds) - height / 2.0, width, height);
+	NSRect rect = NSMakeRect(NSMidX(bounds) - width / 2.0, NSMidY(bounds) - height / 2.0, width, height);
+	return [self backingAlignedRect:rect options:NSAlignAllEdgesNearest];
 }
 
 - (BOOL)mapPoint:(NSPoint)point toX:(int*)x y:(int*)y
@@ -127,9 +186,9 @@ static const NSEventModifierFlags kFlagRCtl = 0x00002000;
 	if (!NSPointInRect(point, image))
 		return NO;
 	CGFloat rx = (point.x - image.origin.x) / image.size.width * _remoteWidth;
-	CGFloat ry = (image.origin.y + image.size.height - point.y) / image.size.height * _remoteHeight;
-	*x = (int)rx;
-	*y = (int)ry;
+	CGFloat ry = (NSMaxY(image) - point.y) / image.size.height * _remoteHeight;
+	*x = MIN(MAX((int)floor(rx), 0), _remoteWidth - 1);
+	*y = MIN(MAX((int)floor(ry), 0), _remoteHeight - 1);
 	return YES;
 }
 

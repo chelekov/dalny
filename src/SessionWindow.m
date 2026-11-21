@@ -42,6 +42,10 @@
 	NSString* _lastReason;
 	BOOL _sawFrame;
 	BOOL _languageOfferShown;
+	NSLayoutConstraint* _viewToBottom;
+	NSLayoutConstraint* _viewToLog;
+	NSTimer* _resizeTimer;
+	NSSize _fittedRemote;
 }
 
 static void log_thunk(void* ctx, const char* line);
@@ -63,6 +67,9 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	                                                   defer:NO];
 	window.title = server.displayTitle;
 	window.minSize = NSMakeSize(640, 420);
+	/* Any area the picture does not cover is black, never the default light background. */
+	window.backgroundColor = NSColor.blackColor;
+	window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
 	self = [super initWithWindow:window];
 	if (self)
 	{
@@ -131,9 +138,101 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		[_logScroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:12],
 		[_logScroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-12],
 		[_logScroll.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-12],
-		[_logScroll.heightAnchor constraintEqualToConstant:140],
-		[_view.bottomAnchor constraintEqualToAnchor:_logScroll.topAnchor constant:-8]
+		[_logScroll.heightAnchor constraintEqualToConstant:140]
 	]];
+	/* The hidden log must not keep its space: the picture goes down to the window edge. */
+	_viewToBottom = [_view.bottomAnchor constraintEqualToAnchor:content.bottomAnchor];
+	_viewToLog = [_view.bottomAnchor constraintEqualToAnchor:_logScroll.topAnchor constant:-8];
+	_viewToBottom.active = YES;
+}
+
+- (BOOL)isFixedMode
+{
+	return [_server.displayMode isEqualToString:@"fixed"];
+}
+
+- (BOOL)isFullScreen
+{
+	return (self.window.styleMask & NSWindowStyleMaskFullScreen) != 0;
+}
+
+// Fixed mode: the window content is the remote desktop (1 pixel = 1 point) plus the controls
+// above it. When that does not fit the screen, the window gets smaller with the same aspect
+// and the picture is scaled down. The window can never grow past the remote size.
+- (void)fitWindowToRemote
+{
+	/* The status line wraps, so the controls' height depends on the width: settle in two passes. */
+	for (int pass = 0; pass < 2; pass++)
+		if (![self fitWindowToRemoteOnce])
+			break;
+}
+
+// Returns YES when the controls' height changed after resizing and another pass is needed.
+- (BOOL)fitWindowToRemoteOnce
+{
+	if (![self isFixedMode] || [self isFullScreen])
+		return NO;
+	NSSize remote = [_view remoteSize];
+	if (remote.width <= 0 || remote.height <= 0)
+		return NO;
+	NSWindow* window = self.window;
+	NSView* content = window.contentView;
+	[content layoutSubtreeIfNeeded];
+	CGFloat chrome = MAX(0, content.bounds.size.height - _view.frame.size.height);
+	NSSize full = NSMakeSize(remote.width, remote.height + chrome);
+	window.contentMaxSize = full;
+	window.contentMinSize = NSMakeSize(MIN(640, full.width), MIN(420, full.height));
+	window.minSize = NSZeroSize;
+
+	NSScreen* screen = window.screen ?: NSScreen.mainScreen;
+	NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, full.width, full.height);
+	NSRect maxContent = [window contentRectForFrameRect:visible];
+	CGFloat scale = MIN(1.0, MIN(maxContent.size.width / remote.width,
+	                             (maxContent.size.height - chrome) / remote.height));
+	if (scale <= 0)
+		scale = 1.0;
+	NSSize size = NSMakeSize(floor(remote.width * scale), floor(remote.height * scale) + chrome);
+	if (scale < 1.0 && !NSEqualSizes(remote, _fittedRemote))
+		[self appendLog:[NSString stringWithFormat:@"Экран сервера %dx%d больше экрана Мака, картинка уменьшена до %d%%.",
+		                                           (int)remote.width, (int)remote.height, (int)(scale * 100)]];
+
+	NSRect old = window.frame;
+	NSRect frame = [window frameRectForContentRect:NSMakeRect(0, 0, size.width, size.height)];
+	frame.origin.x = old.origin.x;
+	frame.origin.y = NSMaxY(old) - frame.size.height;
+	if (NSMaxX(frame) > NSMaxX(visible))
+		frame.origin.x = NSMaxX(visible) - frame.size.width;
+	if (frame.origin.x < visible.origin.x)
+		frame.origin.x = visible.origin.x;
+	if (NSMaxY(frame) > NSMaxY(visible))
+		frame.origin.y = NSMaxY(visible) - frame.size.height;
+	if (frame.origin.y < visible.origin.y)
+		frame.origin.y = visible.origin.y;
+	[window setFrame:frame display:YES animate:NO];
+	_fittedRemote = remote;
+	[content layoutSubtreeIfNeeded];
+	CGFloat after = MAX(0, content.bounds.size.height - _view.frame.size.height);
+	return fabs(after - chrome) > 0.5;
+}
+
+- (void)remoteSizeChanged
+{
+	if (![self isFixedMode])
+		return;
+	if (NSEqualSizes([_view remoteSize], _fittedRemote))
+		return;
+	[self fitWindowToRemote];
+}
+
+- (void)windowWillEnterFullScreen:(NSNotification*)notification
+{
+	self.window.contentMaxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+}
+
+- (void)windowDidExitFullScreen:(NSNotification*)notification
+{
+	if ([self isFixedMode])
+		[self fitWindowToRemote];
 }
 
 // Top-right corner of the title bar: hint plus the RU/EN button.
@@ -685,6 +784,13 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 - (void)deliverFrame:(const uint8_t*)bytes width:(int)width height:(int)height stride:(int)stride
 {
 	[_view updateFrameWithBytes:bytes width:width height:height stride:stride];
+	if (width != _remoteWidth || height != _remoteHeight)
+	{
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[self->_view noteRemoteSizeWidth:width height:height];
+			[self remoteSizeChanged];
+		});
+	}
 	_remoteWidth = width;
 	_remoteHeight = height;
 	if (!_sawFrame)
@@ -703,6 +809,7 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	_remoteHeight = height;
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[self->_view noteRemoteSizeWidth:width height:height];
+		[self remoteSizeChanged];
 	});
 }
 
@@ -747,9 +854,16 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 
 - (void)showWindow:(id)sender
 {
-	[super showWindow:sender];
-	[self.window center];
 	self.window.delegate = (id<NSWindowDelegate>)self;
+	if (!_started && [self isFixedMode] && _server.width >= 200 && _server.height >= 200)
+	{
+		/* Size the window for the requested desktop before the first frame arrives. */
+		[_view noteRemoteSizeWidth:(int)_server.width height:(int)_server.height];
+		[self fitWindowToRemote];
+	}
+	[super showWindow:sender];
+	if (!_started)
+		[self.window center];
 	if (!_started)
 	{
 		_started = YES;
@@ -804,7 +918,34 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 
 - (void)windowDidEndLiveResize:(NSNotification*)notification
 {
+	[_resizeTimer invalidate];
+	_resizeTimer = nil;
 	[self requestFitSize];
+}
+
+// Zoom, tiling and screen changes resize without a live resize. Ask the server once things settle.
+- (void)windowDidResize:(NSNotification*)notification
+{
+	if ([self isFixedMode] || self.window.inLiveResize)
+		return;
+	[_resizeTimer invalidate];
+	_resizeTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+	                                                target:self
+	                                              selector:@selector(resizeTimerFired:)
+	                                              userInfo:nil
+	                                               repeats:NO];
+}
+
+- (void)resizeTimerFired:(NSTimer*)timer
+{
+	_resizeTimer = nil;
+	[self requestFitSize];
+}
+
+- (void)windowDidChangeScreen:(NSNotification*)notification
+{
+	if ([self isFixedMode])
+		[self fitWindowToRemote];
 }
 
 - (void)requestFitSize
@@ -828,6 +969,18 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 {
 	_logScroll.hidden = !_logScroll.hidden;
 	_logButton.title = _logScroll.hidden ? @"Журнал" : @"Скрыть журнал";
+	if (_logScroll.hidden)
+	{
+		_viewToLog.active = NO;
+		_viewToBottom.active = YES;
+	}
+	else
+	{
+		_viewToBottom.active = NO;
+		_viewToLog.active = YES;
+	}
+	if ([self isFixedMode])
+		[self fitWindowToRemote];
 }
 
 - (void)copyLog:(id)sender
@@ -853,6 +1006,8 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	if (_monitor)
 		nw_path_monitor_cancel(_monitor);
 	[_pasteboardTimer invalidate];
+	[_resizeTimer invalidate];
+	_resizeTimer = nil;
 }
 
 @end

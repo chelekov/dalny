@@ -238,7 +238,7 @@ compile clang "${COMMON[@]}" "$OBJDIR"/*.o \
 	-L"$FREERDP/lib" -L"$OPENSSL/lib" \
 	"${LIB_FLAGS[@]}" -lssl -lcrypto -lz -lc++ \
 	-framework Cocoa -framework Security -framework IOKit -framework Network \
-	-framework CoreGraphics -framework CoreFoundation -framework Carbon \
+	-framework CoreGraphics -framework CoreFoundation -framework Carbon -framework QuartzCore \
 	-Wl,-rpath,@executable_path/../Frameworks \
 	-o "$WORK/Dalny"
 

@@ -125,6 +125,15 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
   - The session window clears `RDPView.session` synchronously on the main thread before freeing the session.
 - Files: not supported. It needs `FileGroupDescriptorW` plus `FileContents` streaming and, on xrdp 0.9, FUSE in chansrv. Use SFTP over the same SSH.
 
+### Fixed in 1.0.6
+
+- Fixed mode (for example 1280x800) left a white strip at the bottom of the session window. The hidden log still held its 160 pt because `_view.bottom` was tied to `_logScroll.top`. Now `_view` goes to the window bottom while the log is hidden (`_viewToBottom` / `_viewToLog`).
+- The session window background is black (dark appearance), so any area the picture does not cover is black.
+- `RDPView` draws the frame in its own `CALayer` placed at `imageRect`. Before, `layer.contents` stretched the frame over the whole view while the mouse used a centered, aspect-kept rectangle, so clicks were off. Drawing and mouse mapping now use the same rectangle; points outside it are ignored, coordinates are clamped to the remote size. Remote size is only touched on the main thread.
+- Fixed mode: before the first frame and whenever the remote size changes, the window content is set to remote size (1 pixel = 1 point; on Retina this is sharp at 2x) plus the controls above the picture. `contentMaxSize` is that size, so the window cannot grow past the desktop. A smaller window scales the picture down with the aspect kept. When the remote desktop is larger than the screen's `visibleFrame`, the window is made to fit and the picture is scaled down (logged once). Showing or hiding the log, moving to another screen, and leaving full screen refit the window; full screen lifts the size limit.
+- Fit and full-screen modes already resize the remote desktop through the Display Control channel (`rdp_session_request_resize` → `DISPLAY_CONTROL_MONITOR_LAYOUT`) at the end of a live resize. Zoom, tiling and screen changes now also ask, debounced by 0.5 s. When the server has no Display Control (xrdp 0.9.x may not offer it), the picture is just scaled in the window.
+- QuartzCore is linked explicitly.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.

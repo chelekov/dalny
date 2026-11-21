@@ -17,7 +17,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)sendLanguageToggle;
 /* Cmd+Shift+Space: the Mac shortcut for the language switch menu item. */
 + (BOOL)isLanguageShortcut:(NSEvent*)event;
+/* Main thread only. */
 - (void)noteRemoteSizeWidth:(int)width height:(int)height;
+/* Remote desktop size in pixels, zero before the first frame. Main thread only. */
+- (NSSize)remoteSize;
+- (NSRect)imageRect;
 @end
 
 NS_ASSUME_NONNULL_END

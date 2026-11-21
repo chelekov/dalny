@@ -52,4 +52,21 @@ if grep -n -w 'sudo' src/LanguageSetup.m; then
 	exit 1
 fi
 
+# Session window sizing: the picture is drawn in its own layer at imageRect (same rect as the
+# mouse mapping), unfilled areas are black, and fixed mode limits the window to the remote size.
+if grep -q 'self.layer.contents' src/RDPView.m || ! grep -q '_imageLayer.frame = NSRectToCGRect(\[self imageRect\])' src/RDPView.m; then
+	echo "RDPView must draw the picture in the image layer placed at imageRect" >&2
+	exit 1
+fi
+if ! grep -q 'window.backgroundColor = NSColor.blackColor' src/SessionWindow.m ||
+	! grep -q 'contentMaxSize = full' src/SessionWindow.m ||
+	! grep -q '_viewToBottom' src/SessionWindow.m; then
+	echo "SessionWindow must use a black background and size fixed mode to the remote desktop" >&2
+	exit 1
+fi
+if ! grep -q -- '-framework QuartzCore' scripts/build-macos.sh; then
+	echo "build-macos.sh must link QuartzCore" >&2
+	exit 1
+fi
+
 echo "tree ok"

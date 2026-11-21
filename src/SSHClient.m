@@ -714,8 +714,10 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 		{
 			BOOL hostKey = [stderrCopy rangeOfString:@"host key" options:NSCaseInsensitiveSearch].location != NSNotFound;
 			NSInteger code = hostKey ? 2 : 3;
-			if ([stderrCopy rangeOfString:@"Permission denied" options:NSCaseInsensitiveSearch].location != NSNotFound)
-				code = 1;
+			/* 4: the server rejected the SSH password or key. The UI asks again. */
+			if (!hostKey &&
+			    [stderrCopy rangeOfString:@"Permission denied" options:NSCaseInsensitiveSearch].location != NSNotFound)
+				code = 4;
 			*error = SSHError(code, SSHFailureMessage(stderrCopy, -1, @"Туннель SSH не открылся."));
 		}
 		return NO;

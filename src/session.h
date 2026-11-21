@@ -26,6 +26,9 @@ typedef struct RDPParams
 	char pluginsDir[1024];
 } RDPParams;
 
+/* disconnected(fatal): 0 retry, 1 stop, RDP_FATAL_CREDENTIALS stop and ask for login/password. */
+#define RDP_FATAL_CREDENTIALS 2
+
 typedef struct RDPHandlers
 {
 	void* ctx;

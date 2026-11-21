@@ -35,6 +35,7 @@
 	int _remoteHeight;
 	volatile int _rdpFinished;
 	BOOL _giveUp;
+	BOOL _credentialsRejected;
 	BOOL _started;
 	NSString* _lastReason;
 }
@@ -263,6 +264,71 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	return trusted;
 }
 
+// Wrong login or password: tell the user and let them type it again. Saves to the Keychain.
+// Returns YES when new credentials were saved and a new attempt makes sense.
+- (BOOL)askCredentialsForSSH:(BOOL)ssh
+{
+	NSString* title = _server.displayTitle;
+	NSString* user = ssh && _server.sshUsername.length ? _server.sshUsername : _server.username;
+	NSString* account = ssh ? _server.sshPasswordAccount : _server.rdpPasswordAccount;
+	NSString* notice = [NSString stringWithFormat:@"Неверный логин или пароль %@для сервера «%@». Проверьте и введите заново.",
+	                                              ssh ? @"SSH " : @"", title];
+	[self appendLog:notice];
+	[self setStatus:notice];
+	__block BOOL saved = NO;
+	dispatch_sync(dispatch_get_main_queue(), ^{
+		NSAlert* alert = [NSAlert new];
+		alert.messageText = notice;
+		alert.informativeText = @"Пароль будет сохранён в Связке ключей.";
+		alert.alertStyle = NSAlertStyleWarning;
+		NSTextField* userField = [NSTextField textFieldWithString:user ?: @""];
+		userField.placeholderString = @"Пользователь";
+		NSSecureTextField* passwordField = [NSSecureTextField new];
+		passwordField.placeholderString = @"Пароль";
+		userField.translatesAutoresizingMaskIntoConstraints = NO;
+		passwordField.translatesAutoresizingMaskIntoConstraints = NO;
+		NSStackView* stack = [NSStackView stackViewWithViews:@[ userField, passwordField ]];
+		stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+		stack.spacing = 8;
+		stack.frame = NSMakeRect(0, 0, 300, 56);
+		[NSLayoutConstraint activateConstraints:@[
+			[userField.widthAnchor constraintEqualToConstant:300],
+			[passwordField.widthAnchor constraintEqualToConstant:300]
+		]];
+		alert.accessoryView = stack;
+		[alert addButtonWithTitle:@"Сохранить и подключиться"];
+		[alert addButtonWithTitle:@"Отмена"];
+		alert.window.initialFirstResponder = passwordField;
+		if ([alert runModal] != NSAlertFirstButtonReturn)
+			return;
+		NSString* newUser = [userField.stringValue
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		NSString* newPassword = passwordField.stringValue ?: @"";
+		if (newUser.length == 0 || newPassword.length == 0)
+		{
+			[self appendLog:@"Логин или пароль не введены."];
+			return;
+		}
+		NSError* keychainError = nil;
+		if (![Keychain setSecret:newPassword account:account error:&keychainError])
+		{
+			[self appendLog:keychainError.localizedDescription ?: @"Пароль не записан в Связку ключей."];
+			return;
+		}
+		if (ssh)
+		{
+			if (![newUser isEqualToString:user])
+				self->_server.sshUsername = newUser;
+		}
+		else
+			self->_server.username = newUser;
+		[[ServerStore sharedStore] save];
+		[self appendLog:@"Новые логин и пароль сохранены."];
+		saved = YES;
+	});
+	return saved;
+}
+
 - (void)sleepSeconds:(double)seconds generation:(NSInteger)generation
 {
 	NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
@@ -368,6 +434,22 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 			{
 				lastReason = error.localizedDescription ?: @"Туннель не открылся.";
 				[self appendLog:lastReason];
+				if (error.code == 4 && !_cancelled)
+				{
+					if (sshPasswordAuth && [self askCredentialsForSSH:YES])
+					{
+						attempt = 0;
+						_immediate = YES;
+						continue;
+					}
+					NSString* message = sshPasswordAuth
+					    ? [NSString stringWithFormat:@"Сервер SSH «%@» не принял логин или пароль.", _server.displayTitle]
+					    : [NSString stringWithFormat:@"Сервер SSH «%@» не принял ключ. Проверьте пользователя и ключ в настройках сервера.",
+					                                 _server.displayTitle];
+					[self appendLog:message];
+					[self setStatus:message];
+					break;
+				}
 				if (error.code == 1 || error.code == 2 || !_server.autoReconnect)
 				{
 					[self setStatus:[NSString stringWithFormat:@"Не удалось: %@", lastReason]];
@@ -460,6 +542,20 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 		[_tunnel stop];
 		if (_cancelled)
 			break;
+		if (_giveUp && _credentialsRejected && !_cancelled)
+		{
+			_giveUp = NO;
+			_credentialsRejected = NO;
+			if ([self askCredentialsForSSH:NO])
+			{
+				attempt = 0;
+				_immediate = YES;
+				continue;
+			}
+			[self setStatus:[NSString stringWithFormat:@"Неверный логин или пароль для сервера «%@». Подключение остановлено.",
+			                                           _server.displayTitle]];
+			break;
+		}
 		if (_giveUp)
 			break;
 		if (_immediate || generation != _generation)
@@ -513,6 +609,8 @@ static void disconnect_thunk(void* ctx, int fatal, const char* reason);
 	_lastReason = reason;
 	if (fatal)
 		_giveUp = YES;
+	if (fatal == RDP_FATAL_CREDENTIALS)
+		_credentialsRejected = YES;
 	[self appendLog:reason];
 	if (fatal)
 		[self setStatus:[NSString stringWithFormat:@"Не удалось: %@", reason]];

@@ -14,7 +14,9 @@
 #include <freerdp/scancode.h>
 #include <freerdp/channels/cliprdr.h>
 #include <freerdp/channels/disp.h>
+#include <freerdp/error.h>
 
+#include <winpr/wlog.h>
 #include <winpr/clipboard.h>
 #include <winpr/user.h>
 #include <winpr/synch.h>
@@ -79,6 +81,73 @@ static void log_line(RDPSession* session, const char* line)
 {
 	if (session && session->handlers.logmsg && line)
 		session->handlers.logmsg(session->handlers.ctx, line);
+}
+
+/* FreeRDP WLog -> in-app log. Warnings and errors of the active session. */
+static pthread_mutex_t g_logLock = PTHREAD_MUTEX_INITIALIZER;
+static RDPSession* g_logSession = nullptr;
+static pthread_once_t g_wlogOnce = PTHREAD_ONCE_INIT;
+
+static BOOL wlog_message(const wLogMessage* msg)
+{
+	if (!msg || !msg->TextString)
+		return TRUE;
+	if (msg->Level >= WLOG_WARN)
+		fprintf(stderr, "%s\n", msg->TextString);
+	if (msg->Level < WLOG_WARN || msg->Level > WLOG_FATAL)
+		return TRUE;
+	const char* level = msg->Level >= WLOG_FATAL ? "FATAL" : (msg->Level >= WLOG_ERROR ? "ERROR" : "WARN");
+	char line[1024];
+	snprintf(line, sizeof(line), "FreeRDP %s [%s]: %s", level,
+	         msg->FunctionName ? msg->FunctionName : "?", msg->TextString);
+	pthread_mutex_lock(&g_logLock);
+	log_line(g_logSession, line);
+	pthread_mutex_unlock(&g_logLock);
+	return TRUE;
+}
+
+static void wlog_install(void)
+{
+	wLog* root = WLog_GetRoot();
+	if (!root || !WLog_SetLogAppenderType(root, WLOG_APPENDER_CALLBACK))
+		return;
+	wLogCallbacks callbacks;
+	memset(&callbacks, 0, sizeof(callbacks));
+	callbacks.message = wlog_message;
+	wLogAppender* appender = WLog_GetLogAppender(root);
+	if (appender)
+		(void)WLog_ConfigureAppender(appender, "callbacks", &callbacks);
+}
+
+static void set_log_session(RDPSession* session, RDPSession* expected)
+{
+	pthread_mutex_lock(&g_logLock);
+	if (!expected || g_logSession == expected)
+		g_logSession = session;
+	pthread_mutex_unlock(&g_logLock);
+}
+
+static void log_last_error(RDPSession* session, const char* stage, UINT32 code)
+{
+	const char* name = freerdp_get_last_error_name(code);
+	const char* text = freerdp_get_last_error_string(code);
+	char line[512];
+	snprintf(line, sizeof(line), "%s: %s (0x%08X) — %s", stage, name ? name : "?", (unsigned)code,
+	         text ? text : "?");
+	log_line(session, line);
+}
+
+static int error_is_config(UINT32 code)
+{
+	return code == FREERDP_ERROR_PRE_CONNECT_FAILED || code == FREERDP_ERROR_POST_CONNECT_FAILED;
+}
+
+/* Wrong or missing user name / password. The UI asks for them again instead of retrying. */
+static int error_is_credentials(UINT32 code)
+{
+	return code == FREERDP_ERROR_AUTHENTICATION_FAILED || code == FREERDP_ERROR_CONNECT_LOGON_FAILURE ||
+	       code == FREERDP_ERROR_CONNECT_WRONG_PASSWORD ||
+	       code == FREERDP_ERROR_CONNECT_NO_OR_MISSING_CREDENTIALS;
 }
 
 static RDPSession* session_from(rdpContext* context)
@@ -597,7 +666,14 @@ static void apply_graphics(rdpSettings* settings, const RDPParams* params)
 	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveDelay, 10);
 	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveInterval, 5);
 	freerdp_settings_set_uint32(settings, FreeRDP_TcpKeepAliveRetries, 3);
-	freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, TRUE);
+	/* Heartbeat, multitransport and auto-detect make FreeRDP force rdpdr plus an
+	 * "rdpsnd sys:fake" static channel. rdpsnd is not built (CHANNEL_RDPSND=OFF), so channel
+	 * loading failed and every connect ended in PRE_CONNECT_FAILED. TCP keepalive and SSH
+	 * ServerAlive detect dead links instead. */
+	freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, FALSE);
 	freerdp_settings_set_uint32(settings, FreeRDP_TcpConnectTimeout, 15000);
 	freerdp_settings_set_bool(settings, FreeRDP_IgnoreCertificate, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_Authentication, TRUE);
@@ -630,6 +706,20 @@ static BOOL pre_connect(freerdp* instance)
 	PubSub_SubscribeChannelConnected(context->pubSub, on_channel_connected);
 	PubSub_SubscribeChannelDisconnected(context->pubSub, on_channel_disconnected);
 	return TRUE;
+}
+
+/* Called by FreeRDP inside freerdp_prepare_connect(). FALSE here becomes
+ * PRE_CONNECT_FAILED ("A configuration error ..."), so say which step failed. */
+static BOOL load_channels(freerdp* instance)
+{
+	RDPSession* session = session_from(instance->context);
+	if (freerdp_client_load_channels(instance))
+	{
+		log_line(session, "FreeRDP: каналы загружены.");
+		return TRUE;
+	}
+	log_line(session, "FreeRDP: не удалось загрузить каналы (подробности выше).");
+	return FALSE;
 }
 
 static BOOL post_connect(freerdp* instance)
@@ -665,6 +755,7 @@ static BOOL client_new(freerdp* instance, rdpContext* context)
 	instance->PreConnect = pre_connect;
 	instance->PostConnect = post_connect;
 	instance->PostDisconnect = post_disconnect;
+	instance->LoadChannels = load_channels;
 	instance->AuthenticateEx = authenticate_ex;
 	instance->VerifyCertificateEx = verify_cert_ex;
 	instance->VerifyChangedCertificateEx = verify_changed_cert_ex;
@@ -803,7 +894,15 @@ static void* session_thread(void* argument)
 	{
 		UINT32 code = freerdp_get_last_error(session->context);
 		const char* text = freerdp_get_last_error_string(code);
+		log_last_error(session, "freerdp_connect", code);
 		int fatal = session->certRejected || session->authFailed || error_is_auth(code);
+		if (error_is_config(code))
+		{
+			log_line(session, "Ошибка настройки клиента. Повтор не поможет, переподключение остановлено.");
+			fatal = 1;
+		}
+		if (!session->certRejected && (session->authFailed || error_is_credentials(code)))
+			fatal = RDP_FATAL_CREDENTIALS;
 		if (session->handlers.disconnected)
 			session->handlers.disconnected(session->handlers.ctx, fatal, text ? text : "Нет соединения");
 		return nullptr;
@@ -846,7 +945,11 @@ static void* session_thread(void* argument)
 	if (!session->stop && text && text[0] && strcmp(text, "Success") != 0 &&
 	    strcmp(text, "ERRINFO_SUCCESS") != 0)
 		reason = text;
-	int fatal = session->certRejected || session->authFailed;
+	if (code != FREERDP_ERROR_SUCCESS && code != FREERDP_ERROR_NONE)
+		log_last_error(session, "disconnect", code);
+	int fatal = session->certRejected || session->authFailed || error_is_config(code);
+	if (!session->certRejected && (session->authFailed || error_is_credentials(code)))
+		fatal = RDP_FATAL_CREDENTIALS;
 	if (session->handlers.disconnected)
 		session->handlers.disconnected(session->handlers.ctx, fatal, reason);
 	return nullptr;
@@ -875,6 +978,8 @@ RDPSession* rdp_session_create(const RDPParams* params, const RDPHandlers* handl
 	pthread_mutex_init(&session->lock, nullptr);
 	session->stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 	session->resizeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+	pthread_once(&g_wlogOnce, wlog_install);
+	set_log_session(session, nullptr);
 
 	RDP_CLIENT_ENTRY_POINTS entry;
 	memset(&entry, 0, sizeof(entry));
@@ -931,6 +1036,7 @@ void rdp_session_destroy(RDPSession* session)
 		session->context = nullptr;
 		session->instance = nullptr;
 	}
+	set_log_session(nullptr, session);
 	if (session->clipboard)
 		ClipboardDestroy(session->clipboard);
 	free_server_formats(session);

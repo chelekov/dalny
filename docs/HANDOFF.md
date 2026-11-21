@@ -76,7 +76,7 @@ Connection path when SSH is on (the default):
 4. On drop, path change, or tunnel death: kill SSH, abort FreeRDP, back off, read the Keychain again, repeat.
 5. Authentication failure, a rejected host key, or a rejected certificate stops the loop.
 
-FreeRDP channels are shared libraries copied into `Contents/Frameworks` and loaded with a small `dlopen` provider. Clipboard text uses `cliprdr`. Dynamic resize uses `disp` when the server offers it.
+FreeRDP channels are built into `libfreerdp-client3` (static table). A small provider asks that table first and then falls back to `dlopen` of `lib<name>-client.dylib` in `Contents/Frameworks`. Clipboard text uses `cliprdr`. Dynamic resize uses `disp` when the server offers it.
 
 ## How the CI build works
 
@@ -97,6 +97,13 @@ Each macOS run rebuilds OpenSSL and FreeRDP from scratch. There is no cache.
 The tree is the public-ready snapshot: short server card, Keychain fallback, quoted `known_hosts` path, and release-based updates. Default CI builds x86_64. Universal is opt-in. Releases that the updater installs are tag `v*` builds.
 
 An already installed copy from before the bundle id was `app.dalny.client` will not accept an update, and its Keychain items are under a different service name. That copy is a different app.
+
+### Fixed in 1.0.4
+
+- Every connect failed with «A configuration error prevented a connection to be established» (`FREERDP_ERROR_PRE_CONNECT_FAILED`). Heartbeat PDU and multitransport are on by default in FreeRDP 3. They make `freerdp_client_load_addins` force rdpdr and add a static `rdpsnd sys:fake` channel. rdpsnd is not built (`CHANNEL_RDPSND=OFF`), so channel loading failed before any TCP connect. `apply_graphics` now turns off `SupportHeartbeatPdu`, `SupportMultitransport`, `DeviceRedirection`, and `AudioPlayback`. If sound or rdpdr are ever enabled, build `CHANNEL_RDPSND` too.
+- FreeRDP WLog warnings and errors go to the in-app log (root callback appender). Every failed connect logs the last error name, code, and text.
+- `PRE_CONNECT_FAILED` and `POST_CONNECT_FAILED` stop auto-reconnect.
+- A wrong login or password (RDP `AUTHENTICATION_FAILED`, `LOGON_FAILURE`, `WRONG_PASSWORD`, `NO_OR_MISSING_CREDENTIALS`, a failed logon info from the server, or SSH `Permission denied`, error code 4) stops the loop and opens a dialog to re-enter the user name and password. The dialog saves them to the Keychain and reconnects. A rejected SSH key only shows a notice. xrdp 0.9 without NLA may show its own login screen instead of returning an error; that case shows up inside the session.
 
 ## Known limits
 

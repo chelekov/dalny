@@ -13,7 +13,6 @@
 /* Reconnect backoff in seconds, then 30 s steps until about 5 minutes have passed. */
 static const double kReconnectBackoff[] = {1, 2, 4, 8, 15, 30};
 static const double kReconnectGiveUpSeconds = 300;
-static const int kStallDropMs = 20000;
 
 @implementation SessionWindow
 {
@@ -58,6 +57,7 @@ static const int kStallDropMs = 20000;
 	NSTextField* _overlayDetail;
 	NSButton* _overlayRetry;
 	NSView* _poorBar;
+	NSTitlebarAccessoryViewController* _poorAccessory;
 	NSTextField* _poorText;
 	NSButton* _poorSwitch;
 	BOOL _poorDismissed;
@@ -207,31 +207,40 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	[_overlay addSubview:stack];
 	[content addSubview:_overlay positioned:NSWindowAbove relativeTo:_view];
 
-	_poorBar = [NSView new];
-	_poorBar.wantsLayer = YES;
-	_poorBar.layer.backgroundColor = [NSColor colorWithRed:1.0 green:0.84 blue:0.2 alpha:0.95].CGColor;
-	_poorBar.translatesAutoresizingMaskIntoConstraints = NO;
-	_poorBar.hidden = YES;
-	_poorText = [NSTextField labelWithString:@"Плохое соединение"];
+	/* The poor-link notice lives in the title bar (left, after the window buttons), so it never
+	 * covers the remote desktop. Hidden through the accessory controller. */
+	_poorText = [NSTextField labelWithString:@"⚠ Плохое соединение"];
 	_poorText.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-	_poorText.textColor = NSColor.blackColor;
+	_poorText.textColor = NSColor.systemOrangeColor;
 	_poorText.lineBreakMode = NSLineBreakByTruncatingTail;
 	[_poorText setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
 	                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
-	_poorSwitch = [NSButton buttonWithTitle:@"Переключиться на экстремальную экономию"
+	_poorSwitch = [NSButton buttonWithTitle:@"Экономия 640×480"
 	                                 target:self
 	                                 action:@selector(toggleExtremeEconomy:)];
+	_poorSwitch.bezelStyle = NSBezelStyleRounded;
 	_poorSwitch.controlSize = NSControlSizeSmall;
 	_poorSwitch.refusesFirstResponder = YES;
-	NSButton* hide = [NSButton buttonWithTitle:@"Скрыть" target:self action:@selector(hidePoorNotice:)];
+	_poorSwitch.toolTip = @"Переключиться на экстремальную экономию: 640x480, 256 цветов, намного меньше данных.";
+	NSButton* hide = [NSButton buttonWithTitle:@"✕ Скрыть" target:self action:@selector(hidePoorNotice:)];
+	hide.bezelStyle = NSBezelStyleRounded;
 	hide.controlSize = NSControlSizeSmall;
+	hide.font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]
+	                              weight:NSFontWeightSemibold];
 	hide.refusesFirstResponder = YES;
+	hide.toolTip = @"Скрыть предупреждение до следующего подключения.";
 	NSStackView* bar = [NSStackView stackViewWithViews:@[ _poorText, _poorSwitch, hide ]];
 	bar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-	bar.spacing = 10;
+	bar.alignment = NSLayoutAttributeCenterY;
+	bar.spacing = 8;
 	bar.translatesAutoresizingMaskIntoConstraints = NO;
+	_poorBar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 520, 28)];
 	[_poorBar addSubview:bar];
-	[content addSubview:_poorBar positioned:NSWindowAbove relativeTo:_view];
+	_poorAccessory = [NSTitlebarAccessoryViewController new];
+	_poorAccessory.view = _poorBar;
+	_poorAccessory.layoutAttribute = NSLayoutAttributeLeft;
+	_poorAccessory.hidden = YES;
+	[self.window addTitlebarAccessoryViewController:_poorAccessory];
 
 	[NSLayoutConstraint activateConstraints:@[
 		[_overlay.leadingAnchor constraintEqualToAnchor:_view.leadingAnchor],
@@ -243,13 +252,9 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		[stack.widthAnchor constraintLessThanOrEqualToAnchor:_overlay.widthAnchor constant:-40],
 		[_overlayTitle.widthAnchor constraintLessThanOrEqualToConstant:560],
 		[_overlayDetail.widthAnchor constraintLessThanOrEqualToConstant:560],
-		[_poorBar.leadingAnchor constraintEqualToAnchor:_view.leadingAnchor],
-		[_poorBar.trailingAnchor constraintEqualToAnchor:_view.trailingAnchor],
-		[_poorBar.topAnchor constraintEqualToAnchor:_view.topAnchor],
-		[bar.leadingAnchor constraintEqualToAnchor:_poorBar.leadingAnchor constant:10],
-		[bar.trailingAnchor constraintLessThanOrEqualToAnchor:_poorBar.trailingAnchor constant:-10],
-		[bar.topAnchor constraintEqualToAnchor:_poorBar.topAnchor constant:4],
-		[bar.bottomAnchor constraintEqualToAnchor:_poorBar.bottomAnchor constant:-4]
+		[bar.leadingAnchor constraintEqualToAnchor:_poorBar.leadingAnchor constant:8],
+		[bar.trailingAnchor constraintLessThanOrEqualToAnchor:_poorBar.trailingAnchor constant:-8],
+		[bar.centerYAnchor constraintEqualToAnchor:_poorBar.centerYAnchor]
 	]];
 }
 
@@ -266,7 +271,7 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		self->_overlayRetry.font = [NSFont systemFontOfSize:final ? 18 : 13
 		                                             weight:final ? NSFontWeightSemibold : NSFontWeightRegular];
 		self->_overlayTitle.font = [NSFont systemFontOfSize:final ? 24 : 20 weight:NSFontWeightSemibold];
-		self->_poorBar.hidden = YES;
+		self->_poorAccessory.hidden = YES;
 		self->_overlay.hidden = NO;
 	});
 }
@@ -298,7 +303,7 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 {
 	(void)sender;
 	_poorDismissed = YES;
-	_poorBar.hidden = YES;
+	_poorAccessory.hidden = YES;
 }
 
 // Session thread. Smoothed probe round trip; silence after proven probes means a stall.
@@ -319,16 +324,15 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 				_goodSince = now;
 			if (now - _goodSince >= 10)
 				dispatch_async(dispatch_get_main_queue(), ^{
-					self->_poorBar.hidden = YES;
+					self->_poorAccessory.hidden = YES;
 				});
 		}
 		return;
 	}
-	if (!_probeProven || stalledMs < 3000)
-		return;
-	[self showPoorNotice:[NSString stringWithFormat:@"Плохое соединение: сервер не отвечает %d с.", stalledMs / 1000]];
-	if (stalledMs >= kStallDropMs)
-		_stallDrop = YES;
+	/* An unanswered probe is NOT a dead link: xorgxrdp skips tiles whose content did not change,
+	 * so on an idle desktop a Refresh Rect often gets no reply at all. Dead links are detected by
+	 * the transport: SSH ServerAlive (5 s x 2) ends the tunnel process, TCP keepalive ends FreeRDP. */
+	(void)stalledMs;
 }
 
 - (void)showPoorNotice:(NSString*)text
@@ -337,12 +341,12 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	dispatch_async(dispatch_get_main_queue(), ^{
 		if (self->_poorDismissed || !self->_overlay.hidden || self->_cancelled)
 			return;
-		if (self->_poorBar.hidden)
+		if (self->_poorAccessory.hidden)
 			[self appendLog:text];
-		self->_poorText.stringValue = text;
+		self->_poorText.stringValue = [@"⚠ " stringByAppendingString:text];
 		self->_poorText.toolTip = @"Связь медленная или прерывается. Экстремальная экономия (640x480, 256 цветов) передаёт намного меньше данных.";
 		self->_poorSwitch.hidden = self->_server.isExtremeEconomy;
-		self->_poorBar.hidden = NO;
+		self->_poorAccessory.hidden = NO;
 	});
 }
 
@@ -393,7 +397,7 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	/* A new depth means a new session size: do not reuse the old remote size. */
 	_lastRemoteWidth = 0;
 	_lastRemoteHeight = 0;
-	_poorBar.hidden = YES;
+	_poorAccessory.hidden = YES;
 	_poorDismissed = NO;
 	_view.fitDisplay = ![self isFixedMode];
 	if ([self isFixedMode])
@@ -656,12 +660,13 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		}
 		if (changed)
 		{
-			if (self->_rdp && self->_sawFrame && self->_probeProven && !self->_stallDrop)
+			if (self->_rdp && self->_sawFrame && (self->_probeProven || self->_server.sshEnabled))
 			{
-				/* The session answers link probes: give it a few seconds to prove it survived
-				 * (split-tunnel VPNs often keep it). Otherwise the run loop reconnects. */
+				/* Give the session time to prove it survived (split-tunnel VPNs often keep it):
+				 * a probe answer, or the SSH tunnel outliving ServerAlive (5 s x 2) plus margin.
+				 * A dead tunnel ends the ssh process and the run loop reconnects at once. */
 				self->_pathCheckBaseline = self->_lastAnswer;
-				self->_pathCheckDeadline = CFAbsoluteTimeGetCurrent() + 6;
+				self->_pathCheckDeadline = CFAbsoluteTimeGetCurrent() + (self->_server.sshEnabled ? 15 : 6);
 				[self setStatus:@"Сеть изменилась (VPN или другой интерфейс). Проверяю связь…"];
 				[self appendLog:@"Сетевой маршрут изменился, проверяю, отвечает ли сеанс."];
 				return;
@@ -728,9 +733,21 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		    : @"Сертификат ещё не сохранён. Через туннель имя в нём может быть не 127.0.0.1 — смотрите на отпечаток.";
 		alert.informativeText = [NSString stringWithFormat:@"%@\n\nОтпечаток:\n%@", detail, fingerprint ?: @""];
 		alert.alertStyle = changed ? NSAlertStyleCritical : NSAlertStyleWarning;
-		[alert addButtonWithTitle:@"Доверять"];
-		[alert addButtonWithTitle:@"Отмена"];
-		accepted = [alert runModal] == NSAlertFirstButtonReturn;
+		if (changed)
+		{
+			if (self->_server.certFingerprint.length)
+				alert.informativeText = [alert.informativeText
+				    stringByAppendingFormat:@"\n\nБыл раньше:\n%@", self->_server.certFingerprint];
+			[alert addButtonWithTitle:@"Отмена"];
+			[alert addButtonWithTitle:@"Заменить сертификат"].keyEquivalent = @"";
+			accepted = [alert runModal] == NSAlertSecondButtonReturn;
+		}
+		else
+		{
+			[alert addButtonWithTitle:@"Доверять"];
+			[alert addButtonWithTitle:@"Отмена"];
+			accepted = [alert runModal] == NSAlertFirstButtonReturn;
+		}
 		if (accepted)
 		{
 			self->_server.certFingerprint = fingerprint ?: @"";
@@ -750,9 +767,19 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		    ? [NSString stringWithFormat:@"Это может быть другой компьютер. Новый отпечаток:\n%@", fingerprint]
 		    : [NSString stringWithFormat:@"Первое подключение. Отпечаток:\n%@", fingerprint];
 		alert.alertStyle = changed ? NSAlertStyleCritical : NSAlertStyleWarning;
-		[alert addButtonWithTitle:@"Доверять"];
-		[alert addButtonWithTitle:@"Отмена"];
-		trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		if (changed)
+		{
+			/* Enter must not accept a changed key: Cancel is the default, replacing is a deliberate click. */
+			[alert addButtonWithTitle:@"Отмена"];
+			[alert addButtonWithTitle:@"Заменить ключ"].keyEquivalent = @"";
+			trusted = [alert runModal] == NSAlertSecondButtonReturn;
+		}
+		else
+		{
+			[alert addButtonWithTitle:@"Доверять"];
+			[alert addButtonWithTitle:@"Отмена"];
+			trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		}
 	});
 	return trusted;
 }
@@ -1108,8 +1135,6 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 				/* Twice a second: tunnel process, link stall, path-change check. */
 				if (_server.sshEnabled && ![_tunnel checkAlive])
 					dropReason = @"SSH-туннель оборвался (процесс ssh завершился).";
-				else if (_stallDrop)
-					dropReason = [NSString stringWithFormat:@"Сервер не отвечает %d с.", kStallDropMs / 1000];
 				else if (_pathCheckDeadline > 0)
 				{
 					if (_lastAnswer > _pathCheckBaseline)
@@ -1121,8 +1146,17 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 					else if (CFAbsoluteTimeGetCurrent() > _pathCheckDeadline)
 					{
 						_pathCheckDeadline = 0;
-						dropReason = @"После смены сети сервер не отвечает.";
-						_immediate = YES;
+						if (_server.sshEnabled)
+						{
+							/* ServerAlive had time to notice a dead link; the tunnel is still up. */
+							[self appendLog:@"Сеть изменилась, SSH-туннель жив — переподключение не нужно."];
+							[self setStatus:@"Подключено."];
+						}
+						else
+						{
+							dropReason = @"После смены сети сервер не отвечает.";
+							_immediate = YES;
+						}
 					}
 				}
 				if (dropReason)
@@ -1140,7 +1174,7 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 		dispatch_sync(dispatch_get_main_queue(), ^{
 			[self->_view releaseAllKeys];
 			self->_view.session = nil;
-			self->_poorBar.hidden = YES;
+			self->_poorAccessory.hidden = YES;
 		});
 		rdp_session_destroy(finished);
 		[_tunnel stop];

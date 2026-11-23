@@ -55,9 +55,19 @@ static NSString* const kManualCommand =
 		    ? [NSString stringWithFormat:@"Это может быть другой компьютер. Новый отпечаток:\n%@", fingerprint]
 		    : [NSString stringWithFormat:@"Первое подключение. Отпечаток:\n%@", fingerprint];
 		alert.alertStyle = changed ? NSAlertStyleCritical : NSAlertStyleWarning;
-		[alert addButtonWithTitle:@"Доверять"];
-		[alert addButtonWithTitle:@"Отмена"];
-		trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		if (changed)
+		{
+			/* Enter must not accept a changed key: Cancel is the default, replacing is a deliberate click. */
+			[alert addButtonWithTitle:@"Отмена"];
+			[alert addButtonWithTitle:@"Заменить ключ"].keyEquivalent = @"";
+			trusted = [alert runModal] == NSAlertSecondButtonReturn;
+		}
+		else
+		{
+			[alert addButtonWithTitle:@"Доверять"];
+			[alert addButtonWithTitle:@"Отмена"];
+			trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		}
 	});
 	return trusted;
 }

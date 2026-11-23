@@ -173,6 +173,13 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 - Imported `.dalny.json` and the editor validate every value that reaches `ssh`/`ssh-keyscan` argv: hosts are hostnames, IPv4 or IPv6 (never a leading `-`), SSH users are `[A-Za-z0-9._-]` without a leading `-`, ports are 1–65535 (`DalnyServer isSafeHost:/isSafeUsername:/isValidPort:/validationProblem`). A bad file is rejected with the field named; a good one shows a summary (address, user, SSH on/off, fingerprint) before it is added. Imported files never bring an SSH public key.
 - `SSHClient` checks host/user/port again before every launch (error code 5, no auto-retry) and puts `--` before the destination for `ssh` and the host for `ssh-keyscan`.
 
+### Fixed in 1.0.12 (security)
+
+- A changed SSH host key no longer deletes the trusted key before the user decides: `forgetHost` is not called on that path; `rememberHostKeyLines` replaces the entry only after «Заменить ключ». Cancel keeps the old key, so the next attempt warns again instead of looking like a first connection.
+- Spurious reconnects every 30–60 s: an unanswered Refresh Rect probe was treated as a dead link after 20 s. xorgxrdp does not resend tiles whose content did not change, so on an idle desktop probes often get no reply. Probe silence is no longer a drop reason (the probe only measures RTT for the «Плохое соединение» notice). Dead links are detected by the transport: SSH `ServerAliveInterval=5`/`CountMax=2` ends the tunnel process (`checkAlive`), TCP keepalive ends FreeRDP. After a network-path change with SSH on, the session is kept if the tunnel is still alive after 15 s. Do not re-introduce probe-silence drops.
+- The «Плохое соединение» notice is a left title-bar accessory (`_poorAccessory`), not an overlay on the picture: orange text, «Экономия 640×480» and a bordered bold «✕ Скрыть». It never covers the remote desktop and does not change the content size.
+- The changed-key dialog shows the new and the previous fingerprint. «Отмена» is the default (Enter); «Заменить ключ» has no key equivalent. The same applies to a changed RDP certificate («Заменить сертификат», previous fingerprint shown).
+
 ## Known limits
 
 - No sound, drive, or printer redirection.

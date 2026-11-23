@@ -190,6 +190,29 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	return lines;
 }
 
+/* Fingerprint of the key we already trust for this host, preferring the same key type as `line`. */
++ (nullable NSString*)storedFingerprintForHost:(NSString*)host port:(int)port likeLine:(NSString*)line
+{
+	NSString* token = [[self hostToken:host port:port] stringByAppendingString:@" "];
+	NSString* bare = [host stringByAppendingString:@" "];
+	NSArray<NSString*>* parts = [line componentsSeparatedByString:@" "];
+	NSString* type = parts.count > 1 ? parts[1] : @"";
+	NSString* pick = nil;
+	for (NSString* known in [self knownLines])
+	{
+		if (![known hasPrefix:token] && ![known hasPrefix:bare])
+			continue;
+		if (!pick)
+			pick = known;
+		if (type.length && [known containsString:[NSString stringWithFormat:@" %@ ", type]])
+		{
+			pick = known;
+			break;
+		}
+	}
+	return pick ? [self fingerprintForLine:pick error:NULL] : nil;
+}
+
 + (NSString*)fingerprintForLine:(NSString*)line error:(NSError**)error
 {
 	BOOL timedOut = NO;
@@ -328,7 +351,17 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	NSString* fingerprint = [self fingerprintForLine:lines.firstObject error:error];
 	if (!fingerprint)
 		return NO;
-	BOOL trust = askHost ? askHost(fingerprint, changed) : NO;
+	NSString* shown = fingerprint;
+	if (changed)
+	{
+		NSString* old = [self storedFingerprintForHost:host port:port likeLine:lines.firstObject];
+		if (old.length > 0)
+			shown = [NSString stringWithFormat:@"%@\n\nБыл раньше:\n%@", fingerprint, old];
+		if (log)
+			log([NSString stringWithFormat:@"Новый отпечаток SSH: %@; прежний: %@", fingerprint,
+			                               old.length ? old : @"не найден"]);
+	}
+	BOOL trust = askHost ? askHost(shown, changed) : NO;
 	if (!trust)
 	{
 		if (error)
@@ -760,7 +793,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 		{
 			if (log)
 				log(@"Ключ сервера SSH изменился.");
-			[SSHClient forgetHost:host port:port];
+			/* The old key stays in known_hosts until the user accepts the new one. */
 			if (![SSHClient confirmHost:host port:port changed:YES askHost:askHost log:log error:error])
 			{
 				if (error && !*error)
@@ -865,7 +898,6 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 		if (changed && !alreadyRetried)
 		{
 			[NSThread currentThread].threadDictionary[@"dalny-ssh-retry"] = @YES;
-			[self forgetHost:host port:port];
 			BOOL trusted = [self confirmHost:host port:port changed:YES askHost:askHost log:log error:error];
 			BOOL installed = NO;
 			if (trusted)

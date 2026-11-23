@@ -396,10 +396,20 @@
 		alert.informativeText = changed
 		    ? [NSString stringWithFormat:@"Ключ сервера стал другим. Если вы сами не меняли сервер, нажимать «Доверять» не стоит.\n\nНовый отпечаток:\n%@", fingerprint]
 		    : [NSString stringWithFormat:@"Это первое подключение к этому SSH-серверу. Сверьте отпечаток, если вам его называли.\n\nОтпечаток:\n%@", fingerprint];
-		[alert addButtonWithTitle:@"Доверять"];
-		[alert addButtonWithTitle:@"Отмена"];
 		alert.alertStyle = changed ? NSAlertStyleCritical : NSAlertStyleWarning;
-		trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		if (changed)
+		{
+			/* Enter must not accept a changed key: Cancel is the default, replacing is a deliberate click. */
+			[alert addButtonWithTitle:@"Отмена"];
+			[alert addButtonWithTitle:@"Заменить ключ"].keyEquivalent = @"";
+			trusted = [alert runModal] == NSAlertSecondButtonReturn;
+		}
+		else
+		{
+			[alert addButtonWithTitle:@"Доверять"];
+			[alert addButtonWithTitle:@"Отмена"];
+			trusted = [alert runModal] == NSAlertFirstButtonReturn;
+		}
 	};
 	if (NSThread.isMainThread)
 		show();

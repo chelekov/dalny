@@ -169,9 +169,11 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 			busy = NO;
 			return;
 		}
-		NSString* offer = [NSString
-		    stringWithFormat:@"Доступна версия %@ (сборка %ld). Сейчас установлена %@ (сборка %ld).", remoteShort,
-		                     (long)remoteBuild, [self localShortVersion], (long)[self localBuild]];
+		NSString* offer = remoteBuild > 0
+		    ? [NSString stringWithFormat:@"Доступна версия %@ (сборка %ld). Сейчас установлена %@ (сборка %ld).",
+		                                 remoteShort, (long)remoteBuild, [self localShortVersion], (long)[self localBuild]]
+		    : [NSString stringWithFormat:@"Доступна версия %@. Сейчас установлена %@ (сборка %ld).", remoteShort,
+		                                 [self localShortVersion], (long)[self localBuild]];
 		[DalnyLog append:offer];
 		dispatch_async(dispatch_get_main_queue(), ^{
 			NSAlert* alert = [NSAlert new];
@@ -258,7 +260,14 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 	}
 	NSString* payload = [[NSString alloc] initWithData:body ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"";
 	BOOL rateLimited = [payload rangeOfString:@"rate limit" options:NSCaseInsensitiveSearch].location != NSNotFound;
-	if (status == 403 && rateLimited)
+	if ((status == 403 || status == 429) && rateLimited && token.length == 0)
+	{
+		/* Anonymous API calls share 60/hour per IP; behind a VPN others use that up.
+		 * The public web pages have no such limit. */
+		[DalnyLog append:@"API GitHub упёрся в предел запросов, проверяю через страницу релизов."];
+		return [self latestReleaseFromWebWithError:error];
+	}
+	if ((status == 403 || status == 429) && rateLimited)
 	{
 		if (error)
 			*error = [NSError errorWithDomain:@"app.dalny.client.update"
@@ -328,6 +337,49 @@ willPerformHTTPRedirection:(NSHTTPURLResponse*)response
 		return nil;
 	}
 	return @{@"short" : shortVersion ?: tag, @"build" : @(build), @"asset" : assetURL};
+}
+
+/* No API: /releases/latest redirects to /releases/tag/<tag>; the asset has a fixed download URL. */
++ (NSDictionary*)latestReleaseFromWebWithError:(NSError**)error
+{
+	NSString* address = [NSString stringWithFormat:@"https://github.com/%@/releases/latest", kRepo];
+	NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:address]];
+	request.HTTPMethod = @"HEAD";
+	request.timeoutInterval = 30;
+	[request setValue:@"Dalny" forHTTPHeaderField:@"User-Agent"];
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	__block NSURLResponse* response = nil;
+	__block NSError* taskError = nil;
+	NSURLSessionDataTask* task = [[NSURLSession sharedSession]
+	    dataTaskWithRequest:request
+	      completionHandler:^(NSData* data, NSURLResponse* resp, NSError* err) {
+		      (void)data;
+		      response = resp;
+		      taskError = err;
+		      dispatch_semaphore_signal(done);
+	      }];
+	[task resume];
+	dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+	NSURL* final = response.URL;
+	NSArray<NSString*>* parts = final.pathComponents;
+	NSString* tag = parts.count >= 2 && [parts[parts.count - 2] isEqualToString:@"tag"] ? parts.lastObject : nil;
+	NSCharacterSet* allowed = [NSCharacterSet characterSetWithCharactersInString:@"v0123456789."];
+	if (taskError || [(NSHTTPURLResponse*)response statusCode] != 200 || ![tag hasPrefix:@"v"] ||
+	    [tag rangeOfCharacterFromSet:allowed.invertedSet].location != NSNotFound)
+	{
+		if (error)
+			*error = [NSError errorWithDomain:@"app.dalny.client.update"
+			                             code:taskError ? taskError.code : 1
+			                         userInfo:@{
+				                         NSLocalizedDescriptionKey :
+				                             @"GitHub временно ограничил число запросов, и страницу релизов прочитать не удалось. Повторите проверку позже."
+			                         }];
+		return nil;
+	}
+	NSString* asset =
+	    [NSString stringWithFormat:@"https://github.com/%@/releases/download/%@/%@", kRepo, tag, kAssetName];
+	/* build 0: the caller compares the short versions. */
+	return @{@"short" : [tag substringFromIndex:1], @"build" : @0, @"asset" : asset};
 }
 
 + (BOOL)downloadAndInstallRelease:(NSDictionary*)release token:(NSString*)token error:(NSError**)error

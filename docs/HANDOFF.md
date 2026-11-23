@@ -184,6 +184,10 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 
 - «Плохое соединение: ответ сервера 14.6 с» on a healthy link: the probe delay was used as latency, but xorgxrdp replies to Refresh Rect only when the screen changes, so the "RTT" was the time until the next screen change. Probe replies now only prove liveness (`_lastAnswer`). Latency comes from one ICMP echo every 5 s to the SSH host (or the RDP host without SSH) via `/sbin/ping -c 1 -W 2000`; no reply (ICMP filtered) means no notice. Do not ping or connect to the SSH port for latency: repeated pre-auth connections trip fail2ban.
 
+### Pending for the next release
+
+- Update check survives the anonymous API limit (60 requests/hour per IP, often used up by other users of the same VPN exit): on a 403/429 rate-limit reply without a token, `latestReleaseFromWebWithError:` reads the tag from the `https://github.com/<repo>/releases/latest` redirect and downloads `https://github.com/<repo>/releases/download/<tag>/Dalny-macos.zip`. Neither URL counts against the API limit. Build number is unknown there, so short versions are compared.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.

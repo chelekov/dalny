@@ -71,6 +71,7 @@ static const double kReconnectGiveUpSeconds = 300;
 	volatile BOOL _probeProven;
 	double _rttAverage;
 	volatile CFAbsoluteTime _lastAnswer;
+	volatile BOOL _pingInFlight;
 	volatile CFAbsoluteTime _pathCheckDeadline;
 	CFAbsoluteTime _pathCheckBaseline;
 }
@@ -306,18 +307,59 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 	_poorAccessory.hidden = YES;
 }
 
-// Session thread. Smoothed probe round trip; silence after proven probes means a stall.
+// Session thread. Probe replies prove the session is alive; their silence means nothing.
 - (void)linkRtt:(int)rttMs stalled:(int)stalledMs proven:(int)proven
 {
 	if (proven)
 		_probeProven = YES;
 	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	/* An unanswered probe is NOT a dead link: xorgxrdp skips tiles whose content did not change,
+	 * so on an idle desktop a Refresh Rect often gets no reply at all. Dead links are detected by
+	 * the transport: SSH ServerAlive (5 s x 2) ends the tunnel process, TCP keepalive ends FreeRDP. */
+	(void)stalledMs;
 	if (rttMs >= 0)
 	{
+		/* A probe reply proves the session is alive, but its delay is not network latency:
+		 * xorgxrdp answers only when the screen changes. Latency comes from networkRtt:. */
 		_lastAnswer = now;
+	}
+}
+
+/* One ICMP echo with a 2 s wait; -1 when no reply (ICMP may be filtered: then no notice at all). */
+static int DalnyPingMs(NSString* host)
+{
+	if (![DalnyServer isSafeHost:host] || [host containsString:@":"])
+		return -1;
+	NSTask* task = [NSTask new];
+	task.executableURL = [NSURL fileURLWithPath:@"/sbin/ping"];
+	task.arguments = @[ @"-n", @"-q", @"-c", @"1", @"-W", @"2000", @"--", host ];
+	NSPipe* out = [NSPipe pipe];
+	task.standardOutput = out;
+	task.standardError = [NSFileHandle fileHandleWithNullDevice];
+	if (![task launchAndReturnError:NULL])
+		return -1;
+	NSData* data = [[out fileHandleForReading] readDataToEndOfFile];
+	[task waitUntilExit];
+	if (task.terminationStatus != 0)
+		return -1;
+	NSString* text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+	/* "round-trip min/avg/max/stddev = 41.2/41.2/41.2/0.000 ms" */
+	NSRange eq = [text rangeOfString:@"= " options:NSBackwardsSearch];
+	if (eq.location == NSNotFound)
+		return -1;
+	double ms = [[text substringFromIndex:NSMaxRange(eq)] doubleValue];
+	return ms > 0 ? (int)(ms + 0.5) : -1;
+}
+
+// Ping thread. Real network round trip to the server (ICMP), drives the poor-link notice.
+- (void)networkRtt:(int)rttMs
+{
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	if (rttMs >= 0)
+	{
 		_rttAverage = _rttAverage > 0 ? _rttAverage * 0.7 + rttMs * 0.3 : rttMs;
 		if (_rttAverage > 800)
-			[self showPoorNotice:[NSString stringWithFormat:@"Плохое соединение: ответ сервера %.1f с.", _rttAverage / 1000.0]];
+			[self showPoorNotice:[NSString stringWithFormat:@"Плохое соединение: задержка сети %.1f с.", _rttAverage / 1000.0]];
 		else if (_rttAverage < 500)
 		{
 			if (_goodSince == 0)
@@ -327,13 +369,9 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 					self->_poorAccessory.hidden = YES;
 				});
 		}
-		return;
 	}
-	/* An unanswered probe is NOT a dead link: xorgxrdp skips tiles whose content did not change,
-	 * so on an idle desktop a Refresh Rect often gets no reply at all. Dead links are detected by
-	 * the transport: SSH ServerAlive (5 s x 2) ends the tunnel process, TCP keepalive ends FreeRDP. */
-	(void)stalledMs;
 }
+
 
 - (void)showPoorNotice:(NSString*)text
 {
@@ -1132,6 +1170,22 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 				rdp_session_stop(self->_rdp);
 			else if (!dropReason && ++tick % 5 == 0)
 			{
+				if (tick % 50 == 0 && !_pingInFlight)
+				{
+					/* Every 5 s: real latency for the poor-link notice. */
+					_pingInFlight = YES;
+					NSString* pingHost = _server.sshEnabled ? _server.effectiveSSHHost : _server.host;
+					__weak typeof(self) weakPing = self;
+					dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+						int ms = DalnyPingMs(pingHost);
+						typeof(self) strong = weakPing;
+						if (!strong)
+							return;
+						strong->_pingInFlight = NO;
+						if (ms >= 0)
+							[strong networkRtt:ms];
+					});
+				}
 				/* Twice a second: tunnel process, link stall, path-change check. */
 				if (_server.sshEnabled && ![_tunnel checkAlive])
 					dropReason = @"SSH-туннель оборвался (процесс ssh завершился).";

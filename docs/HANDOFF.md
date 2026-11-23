@@ -180,6 +180,10 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 - The «Плохое соединение» notice is a left title-bar accessory (`_poorAccessory`), not an overlay on the picture: orange text, «Экономия 640×480» and a bordered bold «✕ Скрыть». It never covers the remote desktop and does not change the content size.
 - The changed-key dialog shows the new and the previous fingerprint. «Отмена» is the default (Enter); «Заменить ключ» has no key equivalent. The same applies to a changed RDP certificate («Заменить сертификат», previous fingerprint shown).
 
+### Fixed in 1.0.13
+
+- «Плохое соединение: ответ сервера 14.6 с» on a healthy link: the probe delay was used as latency, but xorgxrdp replies to Refresh Rect only when the screen changes, so the "RTT" was the time until the next screen change. Probe replies now only prove liveness (`_lastAnswer`). Latency comes from one ICMP echo every 5 s to the SSH host (or the RDP host without SSH) via `/sbin/ping -c 1 -W 2000`; no reply (ICMP filtered) means no notice. Do not ping or connect to the SSH port for latency: repeated pre-auth connections trip fail2ban.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.

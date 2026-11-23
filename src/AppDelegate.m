@@ -317,7 +317,31 @@
 		return;
 	}
 	DalnyServer* server = [DalnyServer serverFromDictionary:serverJSON newIdentity:YES];
-	if (!server)
+	NSString* problem = server ? [server validationProblem] : @"В файле нет адреса сервера.";
+	if (problem)
+	{
+		[DalnyLog append:[@"Импорт отклонён. " stringByAppendingString:problem]];
+		NSAlert* alert = [NSAlert new];
+		alert.messageText = @"Файл сервера не принят";
+		alert.informativeText =
+		    [problem stringByAppendingString:@"\n\nТакой файл мог быть изменён специально. Ничего не добавлено."];
+		[alert runModal];
+		return;
+	}
+	NSAlert* review = [NSAlert new];
+	review.messageText = @"Добавить сервер из файла?";
+	review.informativeText = [NSString
+	    stringWithFormat:@"Имя: %@\nАдрес: %@:%ld\nПользователь: %@\nSSH-туннель: %@\nОтпечаток сертификата: %@",
+	                     server.displayTitle, server.host, (long)server.port, server.username,
+	                     server.sshEnabled
+	                         ? [NSString stringWithFormat:@"да, %@@%@:%ld",
+	                                                      server.sshUsername.length ? server.sshUsername : server.username,
+	                                                      server.effectiveSSHHost, (long)server.sshPort]
+	                         : @"нет (соединение без шифрованного туннеля)",
+	                     server.certFingerprint.length ? server.certFingerprint : @"нет"];
+	[review addButtonWithTitle:@"Добавить"];
+	[review addButtonWithTitle:@"Отмена"];
+	if ([review runModal] != NSAlertFirstButtonReturn)
 		return;
 	[[ServerStore sharedStore] addServer:server];
 	[self reload];

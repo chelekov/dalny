@@ -45,6 +45,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString*)sshKeyAccount;
 - (NSString*)effectiveSSHHost;
 - (NSString*)displayTitle;
+/* Safe values for anything that reaches ssh/ssh-keyscan argv: never start with '-',
+ * hostnames/IPv4 [A-Za-z0-9.-], IPv6 hex with ':' (optional [..]), users [A-Za-z0-9._-]. */
++ (BOOL)isSafeHost:(NSString*)host;
++ (BOOL)isSafeUsername:(NSString*)username;
++ (BOOL)isValidPort:(NSInteger)port;
+/* nil when the entry is safe to use; otherwise a Russian message naming the bad field. */
+- (nullable NSString*)validationProblem;
 @end
 
 NS_ASSUME_NONNULL_END

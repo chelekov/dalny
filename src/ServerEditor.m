@@ -446,6 +446,13 @@
 		[self showError:[NSString stringWithFormat:@"Не заполнено: %@.", [missing componentsJoinedByString:@", "]]];
 		return;
 	}
+	if (![DalnyServer isSafeHost:host] || ![DalnyServer isSafeUsername:user] || ![DalnyServer isValidPort:port])
+	{
+		[self showError:@"Недопустимый адрес, пользователь или порт SSH. Адрес — имя или IP без пробелов, "
+		                @"пользователь — латиница, цифры, точка, дефис, подчёркивание (не с дефиса в начале), "
+		                @"порт — от 1 до 65535."];
+		return;
+	}
 	NSAlert* alert = [NSAlert new];
 	alert.messageText = @"Пароль SSH на один раз";
 	alert.informativeText = @"Если пароль SSH тот же, он уже подставлен из карточки. Он нужен один раз, чтобы положить ключ. После этого вход по SSH идёт ключом, а пароль в карточке остаётся для рабочего стола.";
@@ -571,6 +578,26 @@
 		[DalnyLog append:message];
 		[self showError:message];
 		return;
+	}
+	{
+		DalnyServer* probe = [DalnyServer newServer];
+		probe.host = host;
+		probe.username = username;
+		probe.port = [self committedString:_port].length ? [self committedString:_port].integerValue : 3389;
+		probe.sshEnabled = sshOn;
+		NSString* probeSSHHost = [[self committedString:_sshHost]
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		probe.sshHost = probeSSHHost;
+		probe.sshPort = [self committedString:_sshPort].length ? [self committedString:_sshPort].integerValue : 22;
+		probe.sshUsername = [[self committedString:_sshUser]
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		NSString* problem = [probe validationProblem];
+		if (problem)
+		{
+			[DalnyLog append:problem];
+			[self showError:problem];
+			return;
+		}
 	}
 	NSError* keychainError = nil;
 	if (![Keychain setSecret:password account:_server.rdpPasswordAccount error:&keychainError])

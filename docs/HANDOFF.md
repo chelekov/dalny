@@ -168,6 +168,11 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
   - Client: when xrdp announces the helper's re-offer of our own picture (first picture-only server format list within 15 s after the Mac sent a picture without text), the client does not fetch it back (`sentDibMs`), so the Mac pasteboard keeps the original.
   - Client: pictures other than PNG/TIFF (JPEG, HEIC, PDF from Preview) are drawn through `NSImage` when the pasteboard has no text. When the only text next to a picture is a single link (browsers' "Copy Image"), the link is not sent, so server apps get the picture.
 
+### Fixed in 1.0.11 (security)
+
+- Imported `.dalny.json` and the editor validate every value that reaches `ssh`/`ssh-keyscan` argv: hosts are hostnames, IPv4 or IPv6 (never a leading `-`), SSH users are `[A-Za-z0-9._-]` without a leading `-`, ports are 1–65535 (`DalnyServer isSafeHost:/isSafeUsername:/isValidPort:/validationProblem`). A bad file is rejected with the field named; a good one shows a summary (address, user, SSH on/off, fingerprint) before it is added. Imported files never bring an SSH public key.
+- `SSHClient` checks host/user/port again before every launch (error code 5, no auto-retry) and puts `--` before the destination for `ssh` and the host for `ssh-keyscan`.
+
 ## Known limits
 
 - No sound, drive, or printer redirection.

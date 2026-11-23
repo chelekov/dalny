@@ -69,10 +69,13 @@
 	if (dictionary[@"sshEnabled"])
 		server.sshEnabled = [dictionary[@"sshEnabled"] boolValue];
 	server.sshHost = [server string:dictionary[@"sshHost"] fallback:@""];
-	server.sshPort = [dictionary[@"sshPort"] integerValue] ?: 22;
+	server.sshPort = [dictionary[@"sshPort"] respondsToSelector:@selector(integerValue)]
+	                      ? [dictionary[@"sshPort"] integerValue]
+	                      : 22;
 	server.sshUsername = [server string:dictionary[@"sshUsername"] fallback:@""];
 	server.sshAuth = [server string:dictionary[@"sshAuth"] fallback:@"key"];
-	server.sshPublicKey = [server string:dictionary[@"sshPublicKey"] fallback:@""];
+	/* Export never carries a key; an imported file must not bring one either. */
+	server.sshPublicKey = newIdentity ? @"" : [server string:dictionary[@"sshPublicKey"] fallback:@""];
 	server.certFingerprint = [server string:dictionary[@"certFingerprint"] fallback:@""];
 	server.languageSetup = [server string:dictionary[@"languageSetup"] fallback:@""];
 	if ([dictionary[@"profileBeforeExtreme"] isKindOfClass:[NSDictionary class]])
@@ -232,6 +235,78 @@
 - (NSString*)effectiveSSHHost
 {
 	return self.sshHost.length > 0 ? self.sshHost : (self.host ?: @"");
+}
+
++ (BOOL)isSafeHost:(NSString*)host
+{
+	if (![host isKindOfClass:[NSString class]] || host.length == 0 || host.length > 253)
+		return NO;
+	if ([host hasPrefix:@"-"])
+		return NO;
+	NSString* inner = host;
+	if ([host hasPrefix:@"["] && [host hasSuffix:@"]"] && host.length > 2)
+		inner = [host substringWithRange:NSMakeRange(1, host.length - 2)];
+	if ([inner containsString:@":"])
+	{
+		NSCharacterSet* v6 = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF:."];
+		return [inner rangeOfCharacterFromSet:v6.invertedSet].location == NSNotFound;
+	}
+	if (inner != host)
+		return NO;
+	NSCharacterSet* name =
+	    [NSCharacterSet characterSetWithCharactersInString:
+	                        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"];
+	if ([host rangeOfCharacterFromSet:name.invertedSet].location != NSNotFound)
+		return NO;
+	for (NSString* label in [host componentsSeparatedByString:@"."])
+		if (label.length > 63 || [label hasPrefix:@"-"])
+			return NO;
+	return YES;
+}
+
++ (BOOL)isSafeUsername:(NSString*)username
+{
+	if (![username isKindOfClass:[NSString class]] || username.length == 0 || username.length > 64)
+		return NO;
+	if ([username hasPrefix:@"-"])
+		return NO;
+	NSCharacterSet* allowed =
+	    [NSCharacterSet characterSetWithCharactersInString:
+	                        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];
+	return [username rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
++ (BOOL)isValidPort:(NSInteger)port
+{
+	return port >= 1 && port <= 65535;
+}
+
+- (NSString*)validationProblem
+{
+	NSMutableArray<NSString*>* bad = [NSMutableArray array];
+	if (![DalnyServer isSafeHost:self.host])
+		[bad addObject:@"адрес"];
+	if (![DalnyServer isValidPort:self.port])
+		[bad addObject:@"порт рабочего стола"];
+	if ([self.username hasPrefix:@"-"])
+		[bad addObject:@"пользователь"];
+	if (self.sshHost.length > 0 && ![DalnyServer isSafeHost:self.sshHost])
+		[bad addObject:@"адрес SSH"];
+	if (![DalnyServer isValidPort:self.sshPort])
+		[bad addObject:@"порт SSH"];
+	if (self.sshEnabled)
+	{
+		NSString* user = self.sshUsername.length > 0 ? self.sshUsername : self.username;
+		if (![DalnyServer isSafeUsername:user])
+			[bad addObject:self.sshUsername.length > 0 ? @"пользователь SSH"
+			                                           : @"пользователь (он же пользователь SSH)"];
+	}
+	if (bad.count == 0)
+		return nil;
+	return [NSString stringWithFormat:@"Недопустимые значения: %@. Адрес — имя или IP без пробелов, "
+	                                  @"пользователь SSH — латиница, цифры, точка, дефис, подчёркивание "
+	                                  @"(не с дефиса в начале), порт — от 1 до 65535.",
+	                                  [bad componentsJoinedByString:@", "]];
 }
 
 - (NSString*)displayTitle

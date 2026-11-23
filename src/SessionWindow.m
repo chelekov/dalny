@@ -996,7 +996,7 @@ static void link_thunk(void* ctx, int rttMs, int stalledMs, int proven);
 					                                 _server.displayTitle];
 					break;
 				}
-				if (error.code == 1 || error.code == 2)
+				if (error.code == 1 || error.code == 2 || error.code == 5)
 				{
 					stopMessage = [NSString stringWithFormat:@"Не удалось: %@", lastReason];
 					break;

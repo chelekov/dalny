@@ -1,4 +1,5 @@
 #import "SSHClient.h"
+#import "Server.h"
 #import <arpa/inet.h>
 #import <errno.h>
 #import <fcntl.h>
@@ -16,6 +17,17 @@ static NSError* SSHError(NSInteger code, NSString* message)
 	return [NSError errorWithDomain:kSSHErrorDomain
 	                           code:code
 	                       userInfo:@{NSLocalizedDescriptionKey : message ?: @"Ошибка SSH"}];
+}
+
+/* Last line of defence: nothing that ssh could read as an option reaches its argv. */
+static BOOL SSHCheckTarget(NSString* host, int port, NSString* username, NSError** error)
+{
+	if ([DalnyServer isSafeHost:host] && [DalnyServer isValidPort:port] &&
+	    (username == nil || [DalnyServer isSafeUsername:username]))
+		return YES;
+	if (error)
+		*error = SSHError(5, @"Недопустимый адрес, пользователь или порт SSH. Откройте сервер и исправьте поля.");
+	return NO;
 }
 
 static NSString* SSHQuotedOption(NSString* name, NSString* path)
@@ -285,6 +297,8 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
                 log:(void (^)(NSString* line))log
               error:(NSError**)error
 {
+	if (!SSHCheckTarget(host, port, nil, error))
+		return NO;
 	if (!changed && [self knownHostsContainsHost:host port:port])
 		return YES;
 	if (log)
@@ -292,7 +306,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	BOOL timedOut = NO;
 	NSString* portString = [NSString stringWithFormat:@"%d", port];
 	NSString* scan = [self runTool:@"/usr/bin/ssh-keyscan"
-	                     arguments:@[ @"-T", @"12", @"-p", portString, @"-t", @"ed25519,ecdsa,rsa", host ]
+	                     arguments:@[ @"-T", @"12", @"-p", portString, @"-t", @"ed25519,ecdsa,rsa", @"--", host ]
 	                         stdin:nil
 	                      timedOut:&timedOut
 	                         error:error];
@@ -699,6 +713,8 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
                  error:(NSError**)error
 {
 	[self stop];
+	if (!SSHCheckTarget(host, port, username, error))
+		return NO;
 	int local = [SSHClient reserveLocalPort:error];
 	if (local <= 0)
 		return NO;
@@ -718,7 +734,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 		[args addObjectsFromArray:@[ @"-o", @"PreferredAuthentications=password", @"-o",
 			                          @"PubkeyAuthentication=no" ]];
 	}
-	[args addObject:[NSString stringWithFormat:@"%@@%@", username, host]];
+	[args addObjectsFromArray:@[ @"--", [NSString stringWithFormat:@"%@@%@", username, host] ]];
 	if (log)
 		log([NSString stringWithFormat:@"Поднимаю туннель 127.0.0.1:%d → сервер:%d.", local, remotePort]);
 	int stderrFd = -1;
@@ -794,6 +810,8 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 			*error = SSHError(1, @"Открытый ключ выглядит неправильно. Создайте его ещё раз.");
 		return NO;
 	}
+	if (!SSHCheckTarget(host, port, username, error))
+		return NO;
 	if (![self confirmHost:host port:port changed:NO askHost:askHost log:log error:error])
 		return NO;
 	NSString* command = [NSString
@@ -803,7 +821,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	                     publicKey, publicKey];
 	SSHClient* client = [SSHClient new];
 	NSMutableArray* args = [[client commonOptionsForHost:host port:port] mutableCopy];
-	[args addObjectsFromArray:@[ @"-o", @"PreferredAuthentications=password", @"-o", @"PubkeyAuthentication=no",
+	[args addObjectsFromArray:@[ @"-o", @"PreferredAuthentications=password", @"-o", @"PubkeyAuthentication=no", @"--",
 		                          [NSString stringWithFormat:@"%@@%@", username, host], command ]];
 	if (log)
 	{
@@ -889,6 +907,8 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
                    log:(void (^)(NSString* line))log
                  error:(NSError**)error
 {
+	if (!SSHCheckTarget(host, port, username, error))
+		return nil;
 	if (![self confirmHost:host port:port changed:NO askHost:askHost log:log error:error])
 		return nil;
 	/* The script travels as base64 so no shell quoting is involved on either side. */
@@ -907,7 +927,7 @@ static NSString* SSHFailureMessage(NSString* stderrText, int exitCode, NSString*
 	{
 		[args addObjectsFromArray:@[ @"-o", @"PreferredAuthentications=password", @"-o", @"PubkeyAuthentication=no" ]];
 	}
-	[args addObjectsFromArray:@[ [NSString stringWithFormat:@"%@@%@", username, host], command ]];
+	[args addObjectsFromArray:@[ @"--", [NSString stringWithFormat:@"%@@%@", username, host], command ]];
 	int fd = -1;
 	if (![client launchSSHWithArguments:args password:keyPEM.length ? nil : password stderrOut:&fd error:error])
 	{

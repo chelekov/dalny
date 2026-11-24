@@ -1,5 +1,6 @@
 #!/bin/bash
-# Checks the bundled app: x86_64, or x86_64+arm64 when DALNY_UNIVERSAL=1, minos 12.0.
+# Checks the bundled app: x86_64+arm64 (DALNY_UNIVERSAL=0: x86_64 only), minos 12.0,
+# every @rpath dependency present, each library bundled once.
 set -euo pipefail
 
 APP="${1:-dist/Dalny.app}"
@@ -17,7 +18,7 @@ check_file() {
 		echo "missing x86_64: $file ($info)" >&2
 		fail=1
 	fi
-	if [[ "${DALNY_UNIVERSAL:-0}" == "1" && "$info" != *"arm64"* ]]; then
+	if [[ "${DALNY_UNIVERSAL:-1}" == "1" && "$info" != *"arm64"* ]]; then
 		echo "missing arm64: $file ($info)" >&2
 		fail=1
 	fi
@@ -36,11 +37,19 @@ check_file() {
 		fi
 	done <<<"$minos"
 	local deps
-	deps=$(otool -L "$file" | awk 'NR>1 { print $1 }')
+	# Every slice: plain otool -L shows only one architecture of a universal file.
+	deps=$(otool -arch all -L "$file" | awk '/:$/ { next } NF { print $1 }' | sort -u)
 	while read -r dep; do
 		[[ -z "$dep" ]] && continue
 		case "$dep" in
-		/usr/lib/*|/System/*|@rpath/*|@executable_path/*|@loader_path/*) ;;
+		/usr/lib/*|/System/*|@executable_path/*|@loader_path/*) ;;
+		@rpath/*)
+			# The executable and every library find their libraries in Frameworks.
+			if [[ ! -f "$APP/Contents/Frameworks/${dep#@rpath/}" ]]; then
+				echo "missing $dep (wanted by $file)" >&2
+				fail=1
+			fi
+			;;
 		*)
 			echo "unbundled dependency $dep in $file" >&2
 			fail=1
@@ -65,7 +74,7 @@ clipboard_ok=0
 if find "$APP/Contents/Frameworks" -name 'libcliprdr-client*.dylib' | grep -q .; then
 	clipboard_ok=1
 fi
-client_lib="$(find "$APP/Contents/Frameworks" -name 'libfreerdp-client3.dylib' -print -quit)"
+client_lib="$(find "$APP/Contents/Frameworks" -name 'libfreerdp-client3*.dylib' -type f -print -quit)"
 # grep -q closes the pipe early. With pipefail, nm's SIGPIPE would look like a miss.
 if [[ -n "$client_lib" ]]; then
 	set +o pipefail
@@ -76,6 +85,21 @@ if [[ -n "$client_lib" ]]; then
 fi
 if [[ "$clipboard_ok" != "1" ]]; then
 	echo "clipboard channel was not bundled and not linked into libfreerdp-client" >&2
+	fail=1
+fi
+
+# Each library once. Aliases such as libfoo.dylib next to libfoo.3.dylib are full copies.
+while IFS= read -r dylib; do
+	id="$(otool -D "$dylib" | awk 'NR==2 { print $1 }')"
+	if [[ "$(basename "$id")" != "$(basename "$dylib")" ]]; then
+		echo "library $dylib has install name $id: a duplicate or alias" >&2
+		fail=1
+	fi
+done < <(find "$APP/Contents/Frameworks" -name '*.dylib' -type f)
+dups="$(find "$APP/Contents/Frameworks" -type f -exec shasum {} + | awk '{ print $1 }' | sort | uniq -d)"
+if [[ -n "$dups" ]]; then
+	echo "identical files in Frameworks:" >&2
+	find "$APP/Contents/Frameworks" -type f -exec shasum {} + | sort >&2
 	fail=1
 fi
 
@@ -97,7 +121,7 @@ fi
 if [[ "$fail" != "0" ]]; then
 	exit 1
 fi
-if [[ "${DALNY_UNIVERSAL:-0}" == "1" ]]; then
+if [[ "${DALNY_UNIVERSAL:-1}" == "1" ]]; then
 	echo "bundle ok: universal x86_64+arm64, minos 12.0"
 else
 	echo "bundle ok: x86_64, minos 12.0"

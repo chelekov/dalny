@@ -1,6 +1,7 @@
 #!/bin/bash
 # Builds a self-contained Dalny.app for macOS 12.0.
-# Default architecture is x86_64. DALNY_UNIVERSAL=1 also builds arm64 and lipos.
+# Default is universal (x86_64 + arm64): each architecture is built on its own, then lipo
+# merges them. DALNY_UNIVERSAL=0 builds x86_64 only.
 set -euo pipefail
 set -o errtrace
 
@@ -43,8 +44,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 export MACOSX_DEPLOYMENT_TARGET=12.0
-export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-
 select_xcode() {
 	local candidate
 	for candidate in \
@@ -66,6 +65,8 @@ select_xcode() {
 }
 select_xcode
 xcodebuild -version
+# After select_xcode, so the SDK and the compiler come from the same Xcode.
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 
 JOBS="$(sysctl -n hw.ncpu)"
 need=()
@@ -111,7 +112,7 @@ build_openssl() {
 	done
 }
 
-UNIVERSAL="${DALNY_UNIVERSAL:-0}"
+UNIVERSAL="${DALNY_UNIVERSAL:-1}"
 OPENSSL_X86="$WORK/openssl-x86-inst"
 OPENSSL_ARM="$WORK/openssl-arm-inst"
 OPENSSL="$WORK/openssl-uni"
@@ -131,10 +132,11 @@ for lib in libcrypto.3.dylib libssl.3.dylib; do
 	install_name_tool -id "$OPENSSL/lib/$lib" "$OPENSSL/lib/$lib"
 done
 # Point libssl at the libcrypto just installed.
-crypto_dep="$(otool -L "$OPENSSL/lib/libssl.3.dylib" | awk 'NR>1 { print $1 }' | grep libcrypto || true)"
-if [[ -n "$crypto_dep" ]]; then
+# Each slice of a universal libssl names its own build's libcrypto, so change every one.
+while IFS= read -r crypto_dep; do
+	[[ "$crypto_dep" == "$OPENSSL/lib/libcrypto.3.dylib" ]] && continue
 	install_name_tool -change "$crypto_dep" "$OPENSSL/lib/libcrypto.3.dylib" "$OPENSSL/lib/libssl.3.dylib"
-fi
+done < <(otool -arch all -L "$OPENSSL/lib/libssl.3.dylib" | awk '/:$/ { next } NF { print $1 }' | grep libcrypto | sort -u)
 ln -sfn libcrypto.3.dylib "$OPENSSL/lib/libcrypto.dylib"
 ln -sfn libssl.3.dylib "$OPENSSL/lib/libssl.dylib"
 lipo -info "$OPENSSL/lib/libcrypto.3.dylib"
@@ -143,71 +145,100 @@ lipo -info "$OPENSSL/lib/libssl.3.dylib"
 echo "Building FreeRDP"
 mkdir freerdp-src
 tar -C freerdp-src --strip-components=1 -xzf freerdp.tar.gz
+
+# One architecture per CMake tree. A single x86_64;arm64 tree would pass the SSE
+# flags FreeRDP sets per source file to the arm64 slice too. The arm64 tree is a
+# cross build: CMAKE_SYSTEM_PROCESSOR=arm64 keeps the SSE flags off it. NEON needs
+# no flag on arm64: libfreerdp/core/simd.h turns it on from __ARM_NEON.
+build_freerdp() {
+	local arch="$1"
+	local prefix="$2"
+	local cross=()
+	if [[ "$arch" == "arm64" ]]; then
+		cross=(-DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_SYSTEM_PROCESSOR=arm64)
+	fi
+	cmake -G Ninja -S freerdp-src -B "freerdp-build-$arch" \
+		${cross[@]+"${cross[@]}"} \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX="$prefix" \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+		-DCMAKE_OSX_ARCHITECTURES="$arch" \
+		-DCMAKE_OSX_SYSROOT="$SDKROOT" \
+		-DUSE_VERSION_FROM_GIT_TAG=OFF \
+		-DCMAKE_PREFIX_PATH="$OPENSSL" \
+		-DCMAKE_IGNORE_PREFIX_PATH="/usr/local;/opt/homebrew" \
+		-DWITH_JSON_DISABLED=ON \
+		-DOPENSSL_ROOT_DIR="$OPENSSL" \
+		-DOPENSSL_INCLUDE_DIR="$OPENSSL/include" \
+		-DOPENSSL_CRYPTO_LIBRARY="$OPENSSL/lib/libcrypto.dylib" \
+		-DOPENSSL_SSL_LIBRARY="$OPENSSL/lib/libssl.dylib" \
+		-DBUILD_SHARED_LIBS=ON \
+		-DBUILD_TESTING=OFF \
+		-DWITH_SERVER=OFF \
+		-DWITH_PROXY=OFF \
+		-DWITH_SHADOW=OFF \
+		-DWITH_SAMPLE=OFF \
+		-DWITH_CLIENT=ON \
+		-DWITH_CLIENT_COMMON=ON \
+		-DWITH_CLIENT_CHANNELS=ON \
+		-DWITH_CLIENT_SDL=OFF \
+		-DWITH_CLIENT_MAC=OFF \
+		-DWITH_X11=OFF \
+		-DWITH_WAYLAND=OFF \
+		-DWITH_MANPAGES=OFF \
+		-DWITH_FFMPEG=OFF \
+		-DWITH_SWSCALE=OFF \
+		-DWITH_CAIRO=OFF \
+		-DWITH_JPEG=OFF \
+		-DWITH_OPENH264=OFF \
+		-DWITH_GFX_H264=OFF \
+		-DWITH_PCSC=OFF \
+		-DWITH_KRB5=OFF \
+		-DWITH_FUSE=OFF \
+		-DWITH_INTERNAL_RC4=ON \
+		-DWITH_INTERNAL_MD4=ON \
+		-DWITH_VERBOSE_WINPR_ASSERT=OFF \
+		-DWITH_CCACHE=OFF \
+		-DCHANNEL_CLIPRDR=ON \
+		-DCHANNEL_DISP=ON \
+		-DCHANNEL_URBDRC=OFF \
+		-DCHANNEL_TSMF=OFF \
+		-DCHANNEL_RDPECAM=OFF \
+		-DCHANNEL_RDPEAR=OFF \
+		-DCHANNEL_AUDIN=OFF \
+		-DCHANNEL_RDPSND=OFF \
+		-DCHANNEL_PRINTER=OFF \
+		-DCHANNEL_DRIVE=OFF \
+		-DCHANNEL_SMARTCARD=OFF \
+		-DCHANNEL_SERIAL=OFF \
+		-DCHANNEL_PARALLEL=OFF \
+		-DCHANNEL_SSHAGENT=OFF \
+		-DCHANNEL_LOCATION=OFF \
+		-DCHANNEL_VIDEO=OFF \
+		-DWITH_CLIENT_INTERFACE=OFF
+	cmake --build "freerdp-build-$arch" --target install -j"$JOBS"
+}
+
 FREERDP="$WORK/freerdp-inst"
-CMAKE_ARCHS="x86_64"
 CLANG_ARCHS=(-arch x86_64)
 if [[ "$UNIVERSAL" == "1" ]]; then
-	CMAKE_ARCHS="x86_64;arm64"
 	CLANG_ARCHS=(-arch x86_64 -arch arm64)
+	build_freerdp x86_64 "$WORK/freerdp-x86-inst"
+	build_freerdp arm64 "$WORK/freerdp-arm-inst"
+	# Same tree as the x86_64 install, with every real dylib replaced by a lipo of both.
+	cp -R "$WORK/freerdp-x86-inst" "$FREERDP"
+	while IFS= read -r lib; do
+		rel="${lib#"$WORK/freerdp-x86-inst/"}"
+		if [[ ! -f "$WORK/freerdp-arm-inst/$rel" ]]; then
+			echo "arm64 build is missing $rel" >&2
+			exit 1
+		fi
+		lipo -create "$lib" "$WORK/freerdp-arm-inst/$rel" -output "$FREERDP/$rel"
+		lipo -info "$FREERDP/$rel"
+	done < <(find "$WORK/freerdp-x86-inst/lib" -name '*.dylib' -type f)
+else
+	build_freerdp x86_64 "$FREERDP"
 fi
-cmake -G Ninja -S freerdp-src -B freerdp-build \
-	-DCMAKE_BUILD_TYPE=Release \
-	-DCMAKE_INSTALL_PREFIX="$FREERDP" \
-	-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
-	-DCMAKE_OSX_ARCHITECTURES="$CMAKE_ARCHS" \
-	-DUSE_VERSION_FROM_GIT_TAG=OFF \
-	-DCMAKE_PREFIX_PATH="$OPENSSL" \
-	-DCMAKE_IGNORE_PREFIX_PATH="/usr/local;/opt/homebrew" \
-	-DWITH_JSON_DISABLED=ON \
-	-DOPENSSL_ROOT_DIR="$OPENSSL" \
-	-DOPENSSL_INCLUDE_DIR="$OPENSSL/include" \
-	-DOPENSSL_CRYPTO_LIBRARY="$OPENSSL/lib/libcrypto.dylib" \
-	-DOPENSSL_SSL_LIBRARY="$OPENSSL/lib/libssl.dylib" \
-	-DBUILD_SHARED_LIBS=ON \
-	-DBUILD_TESTING=OFF \
-	-DWITH_SERVER=OFF \
-	-DWITH_PROXY=OFF \
-	-DWITH_SHADOW=OFF \
-	-DWITH_SAMPLE=OFF \
-	-DWITH_CLIENT=ON \
-	-DWITH_CLIENT_COMMON=ON \
-	-DWITH_CLIENT_CHANNELS=ON \
-	-DWITH_CLIENT_SDL=OFF \
-	-DWITH_CLIENT_MAC=OFF \
-	-DWITH_X11=OFF \
-	-DWITH_WAYLAND=OFF \
-	-DWITH_MANPAGES=OFF \
-	-DWITH_FFMPEG=OFF \
-	-DWITH_SWSCALE=OFF \
-	-DWITH_CAIRO=OFF \
-	-DWITH_JPEG=OFF \
-	-DWITH_OPENH264=OFF \
-	-DWITH_GFX_H264=OFF \
-	-DWITH_PCSC=OFF \
-	-DWITH_KRB5=OFF \
-	-DWITH_FUSE=OFF \
-	-DWITH_INTERNAL_RC4=ON \
-	-DWITH_INTERNAL_MD4=ON \
-	-DWITH_VERBOSE_WINPR_ASSERT=OFF \
-	-DWITH_CCACHE=OFF \
-	-DCHANNEL_CLIPRDR=ON \
-	-DCHANNEL_DISP=ON \
-	-DCHANNEL_URBDRC=OFF \
-	-DCHANNEL_TSMF=OFF \
-	-DCHANNEL_RDPECAM=OFF \
-	-DCHANNEL_RDPEAR=OFF \
-	-DCHANNEL_AUDIN=OFF \
-	-DCHANNEL_RDPSND=OFF \
-	-DCHANNEL_PRINTER=OFF \
-	-DCHANNEL_DRIVE=OFF \
-	-DCHANNEL_SMARTCARD=OFF \
-	-DCHANNEL_SERIAL=OFF \
-	-DCHANNEL_PARALLEL=OFF \
-	-DCHANNEL_SSHAGENT=OFF \
-	-DCHANNEL_LOCATION=OFF \
-	-DCHANNEL_VIDEO=OFF \
-	-DWITH_CLIENT_INTERFACE=OFF
-cmake --build freerdp-build --target install -j"$JOBS"
 
 if [[ -d "$FREERDP/include/freerdp3" ]]; then
 	INC=(-I"$FREERDP/include/freerdp3" -I"$FREERDP/include/winpr3")
@@ -288,6 +319,11 @@ echo "Version $VERSION ($BUILD)"
 chmod +x "$APP/Contents/MacOS/Dalny" "$APP/Contents/MacOS/DalnyAskpass"
 
 FRAME="$APP/Contents/Frameworks"
+# Dependencies of every architecture slice. Plain `otool -L` shows only one slice of a
+# universal file, so a path that differs in the arm64 slice would stay unrewritten.
+deps_all() {
+	otool -arch all -L "$1" | awk '/:$/ { next } NF { print $1 }' | sort -u
+}
 copy_real() {
 	local src="$1"
 	local name
@@ -297,8 +333,14 @@ copy_real() {
 	chmod u+w "$FRAME/$name"
 }
 
+# Each library once, under its install name (libfoo.3.dylib). The other names
+# (libfoo.dylib, libfoo.3.33.1.dylib) are build-time aliases that nothing loads;
+# copying them made a second and third full copy of every library.
 while IFS= read -r lib; do
-	copy_real "$lib"
+	id="$(otool -D "$lib" | awk 'NR==2 { print $1 }')"
+	if [[ "$(basename "$id")" == "$(basename "$lib")" ]]; then
+		copy_real "$lib"
+	fi
 done < <(find "$FREERDP/lib" "$OPENSSL/lib" -name '*.dylib' \( -type f -o -type l \))
 
 # Pull in anything the executable or bundled libraries still reference by absolute path.
@@ -318,7 +360,7 @@ while [[ "$changed" == "1" ]]; do
 					changed=1
 				fi
 			fi
-		done < <(otool -L "$file" | awk 'NR>1 { print $1 }')
+		done < <(deps_all "$file")
 	done < <(find "$APP/Contents/MacOS" "$FRAME" -type f)
 done
 
@@ -339,7 +381,7 @@ rewrite() {
 		if [[ -e "$FRAME/$depbase" ]]; then
 			install_name_tool -change "$dep" "@rpath/$depbase" "$file"
 		fi
-	done < <(otool -L "$file" | awk 'NR>1 { print $1 }')
+	done < <(deps_all "$file")
 }
 
 while IFS= read -r file; do
@@ -360,9 +402,9 @@ while IFS= read -r file; do
 done < <(find "$FRAME" -type f \( -name '*.dylib' -o -name '*.so' \))
 codesign --force --sign - "$APP/Contents/MacOS/DalnyAskpass"
 codesign --force --deep --sign - "$APP"
-codesign --verify --verbose=2 "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
-bash "$ROOT/scripts/verify-bundle.sh" "$APP"
+DALNY_UNIVERSAL="$UNIVERSAL" bash "$ROOT/scripts/verify-bundle.sh" "$APP"
 (
 	cd "$ROOT/dist"
 	ditto -c -k --keepParent Dalny.app Dalny-macos.zip

@@ -12,7 +12,7 @@ The app name is **Дальний** (bundle id `app.dalny.client`, executable `Da
 
 ### Machine and protocol
 
-- Target: macOS 12 or later, Intel and Apple Silicon. Deployment target **macOS 12.0**. The default CI binary is **x86_64**. A workflow input can also build a universal x86_64+arm64 binary. Every bundled dylib uses the same architectures and the same minimum OS.
+- Target: macOS 12 or later, Intel and Apple Silicon. Deployment target **macOS 12.0**. The CI binary is **universal x86_64+arm64**. A `workflow_dispatch` input can build x86_64 only. Every bundled dylib uses the same architectures and the same minimum OS.
 - Protocol is RDP to xrdp. Typing must not drop letters in Russian or English.
 
 ### Product
@@ -38,7 +38,7 @@ The app name is **Дальний** (bundle id `app.dalny.client`, executable `Da
 ### CI
 
 - Ubuntu job on every push: `bash -n` and a few static checks. It does not compile the app.
-- macOS job only for tags `v*` and `workflow_dispatch`, on `macos-15-intel`, timeout 120 minutes. Default architecture is x86_64. `workflow_dispatch` has an input to also build arm64 and lipo a universal app.
+- macOS job only for tags `v*` and `workflow_dispatch`, on `macos-15-intel`, timeout 120 minutes. Default is universal. `workflow_dispatch` has an input to build x86_64 only.
 - Concurrency group per ref, cancel in progress.
 - A tag `v*` uploads artifact `Dalny-macos` and publishes a GitHub Release with `CFBundleShortVersionString` from the tag and `CFBundleVersion` from the Actions run number. A manual run uploads the artifact and does not replace the latest release.
 - `scripts/verify-bundle.sh` checks the architectures that were requested, minos 12.x, no absolute non-system deps, and the clipboard channel.
@@ -86,7 +86,7 @@ FreeRDP channels are built into `libfreerdp-client3` (static table). A small pro
 `scripts/build-macos.sh`:
 
 1. Download OpenSSL 3.4.1 and FreeRDP 3.33.1.
-2. Build OpenSSL shared for the requested architectures with `-mmacosx-version-min=12.0`. A universal build lipos x86_64 and arm64.
+2. Build OpenSSL shared for the requested architectures with `-mmacosx-version-min=12.0`. A universal build lipos x86_64 and arm64. FreeRDP is built in one CMake tree per architecture (arm64 as a cross build with `CMAKE_SYSTEM_PROCESSOR=arm64`), then each dylib is lipo'd. A single `x86_64;arm64` tree would give the arm64 slice FreeRDP's per-file `-msse*` flags. Rewrites read `otool -arch all -L`: plain `otool -L` shows one slice only.
 3. Configure FreeRDP with Ninja, `CMAKE_OSX_ARCHITECTURES` set to the same list, `CMAKE_OSX_DEPLOYMENT_TARGET=12.0`, shared libs, client only, no SDL, no Mac client sample, no FFmpeg, no H.264, no server. `WITH_JSON_DISABLED=ON` and `CMAKE_IGNORE_PREFIX_PATH=/usr/local;/opt/homebrew`. Pass `-DUSE_VERSION_FROM_GIT_TAG=OFF` so a tag on this repository is not read as the FreeRDP version (that installs headers under `freerdp1` instead of `freerdp3`).
 4. Compile the app with `clang`/`clang++` and `-mmacosx-version-min=12.0`. C and Objective-C files pass `-Dnullptr=NULL` because FreeRDP headers use `nullptr`.
 5. Build `Contents/Resources/AppIcon.icns` from `resources/AppIcon.png` (1024x1024) with `sips` and `iconutil`, sizes 16..512 plus @2x. `Info.plist` points to it with `CFBundleIconFile=AppIcon`.
@@ -98,7 +98,7 @@ Each macOS run rebuilds OpenSSL and FreeRDP from scratch. There is no cache.
 
 ## Current status
 
-The tree is the public-ready snapshot: short server card, Keychain fallback, quoted `known_hosts` path, and release-based updates. Default CI builds x86_64. Universal is opt-in. Releases that the updater installs are tag `v*` builds.
+The tree is the public-ready snapshot: short server card, Keychain fallback, quoted `known_hosts` path, and release-based updates. CI builds universal by default. Releases that the updater installs are tag `v*` builds.
 
 An already installed copy from before the bundle id was `app.dalny.client` will not accept an update, and its Keychain items are under a different service name. That copy is a different app.
 
@@ -186,6 +186,9 @@ An already installed copy from before the bundle id was `app.dalny.client` will 
 
 ### Pending for the next release
 
+- Universal app (x86_64+arm64), native on Apple Silicon. Before, the release was x86_64 only and an M1 Mac without Rosetta could not open it.
+- Each library is bundled once, under its install name. The aliases (`libfoo.dylib`, `libfoo.3.33.1.dylib`) were full copies: 23.7 MB of Frameworks held 9.9 MB of distinct code. `verify-bundle.sh` now fails on an alias, on identical files, and on an `@rpath` dependency missing from Frameworks, in every slice.
+- CI: the `apple-silicon` job (`macos-15`, arm64) downloads the artifact, runs `codesign --verify --deep --strict`, dlopens every bundled library natively and starts the app with `DYLD_PRINT_LIBRARIES`. The `release` job needs it, so an arm64 slice that does not load is never published.
 - Update check survives the anonymous API limit (60 requests/hour per IP, often used up by other users of the same VPN exit): on a 403/429 rate-limit reply without a token, `latestReleaseFromWebWithError:` reads the tag from the `https://github.com/<repo>/releases/latest` redirect and downloads `https://github.com/<repo>/releases/download/<tag>/Dalny-macos.zip`. Neither URL counts against the API limit. Build number is unknown there, so short versions are compared.
 
 ## Known limits

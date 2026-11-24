@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       universal:
-        description: Also build arm64 and lipo a universal app
+        description: Universal x86_64+arm64 app (off builds x86_64 only)
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -31,15 +31,13 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-15-intel
     timeout-minutes: 120
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build app
         env:
-          DALNY_UNIVERSAL: ${{ github.event_name == 'workflow_dispatch' && inputs.universal && '1' || '0' }}
+          DALNY_UNIVERSAL: ${{ (github.event_name != 'workflow_dispatch' || inputs.universal) && '1' || '0' }}
         run: bash scripts/build-macos.sh
 
       - name: Upload Dalny.app
@@ -54,16 +52,89 @@ jobs:
         run: |
           echo "short=$(tr -d '\n' < dist/version-short.txt)" >> "$GITHUB_OUTPUT"
           echo "build=$(tr -d '\n' < dist/version-build.txt)" >> "$GITHUB_OUTPUT"
+    outputs:
+      short: ${{ steps.ver.outputs.short }}
+      build: ${{ steps.ver.outputs.build }}
+
+  # The build runner is Intel, so it never runs the arm64 slice. Load it on Apple
+  # Silicon before anything is published.
+  apple-silicon:
+    needs: build
+    if: github.event_name != 'workflow_dispatch' || inputs.universal
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Download Dalny.app
+        uses: actions/download-artifact@v4
+        with:
+          name: Dalny-macos
+
+      - name: Load on arm64
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          ditto -x -k Dalny-macos.zip .
+          APP=Dalny.app
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          for bin in "$APP"/Contents/MacOS/*; do
+            lipo "$bin" -verify_arch arm64 x86_64
+          done
+          # dlopen every bundled library natively. The client library pulls in
+          # FreeRDP, WinPR and OpenSSL through @rpath, so load it last.
+          cat > /tmp/load.c <<'EOF'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc, char **argv) {
+            for (int i = 1; i < argc; i++) {
+              if (!dlopen(argv[i], RTLD_NOW)) { fprintf(stderr, "%s\n", dlerror()); return 1; }
+              printf("loaded %s\n", argv[i]);
+            }
+            return 0;
+          }
+          EOF
+          clang -arch arm64 -o /tmp/load /tmp/load.c
+          /tmp/load "$APP"/Contents/Frameworks/libcrypto.3.dylib \
+            "$APP"/Contents/Frameworks/libssl.3.dylib \
+            "$APP"/Contents/Frameworks/libwinpr3.3.dylib \
+            "$APP"/Contents/Frameworks/libfreerdp3.3.dylib \
+            "$APP"/Contents/Frameworks/libfreerdp-client3.3.dylib
+          # The app itself: dyld must resolve every library and symbol before main.
+          DYLD_PRINT_LIBRARIES=1 "$APP/Contents/MacOS/Dalny" > /tmp/dyld.log 2>&1 &
+          pid=$!
+          sleep 10
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" || true
+            if grep -q "Library not loaded\|Symbol not found" /tmp/dyld.log; then
+              cat /tmp/dyld.log
+              exit 1
+            fi
+          fi
+          kill "$pid" 2>/dev/null || true
+          grep -c "Contents/Frameworks" /tmp/dyld.log
+          grep -q "libfreerdp-client3.3.dylib" /tmp/dyld.log
+
+  release:
+    needs: [build, apple-silicon]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download Dalny.app
+        uses: actions/download-artifact@v4
+        with:
+          name: Dalny-macos
+          path: dist
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Дальний ${{ steps.ver.outputs.short }} (${{ steps.ver.outputs.build }})
+          name: Дальний ${{ needs.build.outputs.short }} (${{ needs.build.outputs.build }})
           make_latest: true
           fail_on_unmatched_files: true
           files: dist/Dalny-macos.zip
           body: |
-            CFBundleShortVersionString: ${{ steps.ver.outputs.short }}
-            CFBundleVersion: ${{ steps.ver.outputs.build }}
+            CFBundleShortVersionString: ${{ needs.build.outputs.short }}
+            CFBundleVersion: ${{ needs.build.outputs.build }}
